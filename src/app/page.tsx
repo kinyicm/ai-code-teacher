@@ -9,6 +9,7 @@ import {
   systemPromptFor,
   type ModeId,
 } from "@/lib/modes";
+import { looksLikeErrorStack, parseJavaError } from "@/lib/errorParser";
 
 interface ChatMessage {
   id: string;
@@ -19,22 +20,31 @@ interface ChatMessage {
 
 /**
  * 调用 /api/chat 获取 SSE 流式回答，onDelta 在每次收到增量时回调（参数为累计全文）。
+ * history 为之前的对话（{role, content}），用于多轮上下文。
  * 返回 { ok, content, error }。
  */
 async function streamChat(
   mode: ModeId,
   userContent: string,
+  history: { role: "user" | "assistant"; content: string }[],
+  signal: AbortSignal | undefined,
   onDelta: (full: string) => void,
 ): Promise<{ ok: boolean; content: string; error?: string }> {
+  // 组装：system + 历史（最近10条）+ 当前问题
+  const recentHistory = history.slice(-10);
+  const payloadMessages = [
+    { role: "system" as const, content: systemPromptFor(mode) },
+    ...recentHistory,
+    { role: "user" as const, content: userContent },
+  ];
+
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      messages: [
-        { role: "system", content: systemPromptFor(mode) },
-        { role: "user", content: userContent },
-      ],
+      messages: payloadMessages,
     }),
+    signal,
   });
 
   if (!res.ok || !res.body) {
@@ -116,8 +126,10 @@ export default function Home() {
   const [isThinking, setIsThinking] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [language, setLanguage] = useState("java");
+  const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   const activeMode = MODES.find((item) => item.id === mode) ?? MODES[0];
 
@@ -155,6 +167,27 @@ export default function Home() {
     const content = input.trim();
     if (!content || isThinking) return;
 
+    // 报错堆栈智能解析：如果检测到 Java 异常，自动附加结构化摘要
+    let finalContent = content;
+    let parsedNote = "";
+    if (looksLikeErrorStack(content)) {
+      const parsed = parseJavaError(content);
+      if (parsed.isJavaStack && parsed.summary) {
+        parsedNote = parsed.summary;
+        finalContent = `【系统已自动识别为 Java 报错堆栈，解析结果如下】\n${parsed.summary}\n\n【原始报错】\n${content}\n\n请基于以上解析结果，用通俗语言解释这个错误的原因和修复方法。`;
+      }
+    }
+
+    // 构造历史对话：过滤掉空内容和错误提示，只保留 role + content
+    const history = messages
+      .filter(
+        (m) =>
+          m.content.trim() !== "" &&
+          !m.content.startsWith("> ⚠️") &&
+          !m.content.startsWith("> （"),
+      )
+      .map((m) => ({ role: m.role, content: m.content }));
+
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: "user",
@@ -162,6 +195,8 @@ export default function Home() {
       mode,
     };
     const assistantId = crypto.randomUUID();
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     setMessages((prev) => [...prev, userMessage]);
     setInput("");
@@ -180,7 +215,13 @@ export default function Home() {
     };
 
     try {
-      const result = await streamChat(mode, content, applyToAssistant);
+      const result = await streamChat(
+        mode,
+        finalContent,
+        history,
+        controller.signal,
+        applyToAssistant,
+      );
 
       if (!result.ok) {
         applyToAssistant(`> ⚠️ 请求失败：${result.error}`);
@@ -188,11 +229,42 @@ export default function Home() {
         applyToAssistant("> （模型没有返回内容，请重试）");
       }
     } catch (err) {
-      applyToAssistant(
-        `> ⚠️ 网络错误：${err instanceof Error ? err.message : "未知错误"}`,
-      );
+      // 用户主动中断：保留已生成内容，追加停止提示
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setMessages((prev) =>
+          prev.map((m) => {
+            if (m.id !== assistantId) return m;
+            const generated = m.content.trim();
+            return {
+              ...m,
+              content: generated
+                ? `${generated}\n\n_（已停止生成）_`
+                : "_（已停止生成）_",
+            };
+          }),
+        );
+      } else {
+        applyToAssistant(
+          `> ⚠️ 网络错误：${err instanceof Error ? err.message : "未知错误"}`,
+        );
+      }
     } finally {
       setIsThinking(false);
+      abortRef.current = null;
+    }
+  }
+
+  function handleStop() {
+    abortRef.current?.abort();
+  }
+
+  async function handleCopy(content: string, id: string) {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopiedId(id);
+      setTimeout(() => setCopiedId((cur) => (cur === id ? null : cur)), 2000);
+    } catch {
+      // 剪贴板不可用时忽略
     }
   }
 
@@ -267,6 +339,19 @@ export default function Home() {
               </select>
             </div>
 
+            {/* 报错堆栈智能解析提示 */}
+            {looksLikeErrorStack(input) ? (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2">
+                <p className="mb-1 flex items-center gap-1.5 text-[11px] font-medium text-amber-300">
+                  <span className="h-1.5 w-1.5 rounded-full bg-amber-400" />
+                  已识别为 Java 报错，自动解析如下：
+                </p>
+                <pre className="whitespace-pre-wrap font-mono text-[11px] leading-relaxed text-amber-200/80">
+                  {parseJavaError(input).summary || "（解析中…）"}
+                </pre>
+              </div>
+            ) : null}
+
             <CodeEditor
               value={input}
               onChange={setInput}
@@ -288,14 +373,24 @@ export default function Home() {
                 >
                   清空
                 </button>
-                <button
-                  type="button"
-                  onClick={handleSubmit}
-                  disabled={!input.trim() || isThinking}
-                  className="rounded-lg bg-indigo-500 px-4 py-1.5 text-[13px] font-medium text-white transition-colors hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-40"
-                >
-                  {isThinking ? "生成中…" : "发送"}
-                </button>
+                {isThinking ? (
+                  <button
+                    type="button"
+                    onClick={handleStop}
+                    className="rounded-lg border border-red-500/40 bg-red-500/10 px-4 py-1.5 text-[13px] font-medium text-red-300 transition-colors hover:bg-red-500/20"
+                  >
+                    停止生成
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleSubmit}
+                    disabled={!input.trim()}
+                    className="rounded-lg bg-indigo-500 px-4 py-1.5 text-[13px] font-medium text-white transition-colors hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    发送
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -355,10 +450,20 @@ export default function Home() {
                   key={message.id}
                   className="rounded-xl border border-zinc-800 bg-zinc-950/50 px-4 py-3.5"
                 >
-                  <p className="mb-2 flex items-center gap-2 text-[11px] text-zinc-500">
-                    <span className="h-1.5 w-1.5 rounded-full bg-indigo-400" />
-                    AI 助手 · {MODE_LABEL[message.mode]}
-                  </p>
+                  <div className="mb-2 flex items-center justify-between">
+                    <p className="flex items-center gap-2 text-[11px] text-zinc-500">
+                      <span className="h-1.5 w-1.5 rounded-full bg-indigo-400" />
+                      AI 助手 · {MODE_LABEL[message.mode]}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => handleCopy(message.content, message.id)}
+                      disabled={!message.content.trim()}
+                      className="text-[11px] text-zinc-500 transition-colors hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-40"
+                    >
+                      {copiedId === message.id ? "已复制 ✓" : "复制"}
+                    </button>
+                  </div>
                   <MarkdownMessage content={message.content} />
                 </div>
               ),
