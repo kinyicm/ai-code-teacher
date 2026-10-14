@@ -46,51 +46,25 @@ export async function POST(req: NextRequest) {
     return jsonError("服务端未配置 ZHIPU_API_KEY", 500);
   }
 
-  const MAX_RETRIES = 3;
-  const RETRY_DELAY_MS = 3000;
-  let upstream: Response;
-  let lastError = "";
+  const upstream = await fetch(API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      messages,
+      stream: true,
+    }),
+  });
 
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    upstream = await fetch(API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        messages,
-        stream: true,
-      }),
-    });
-
-    if (upstream.ok && upstream.body) break;
-
-    // 非429错误直接返回，不重试
-    if (upstream.status !== 429) {
-      const text = await upstream.text();
-      return jsonError(
-        `智谱 API 请求失败（${upstream.status}）: ${text}`,
-        502,
-      );
-    }
-
-    // 429限流：等待后重试
-    lastError = await upstream.text();
-    if (attempt < MAX_RETRIES) {
-      await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
-    }
+  if (!upstream.ok || !upstream.body) {
+    const text = await upstream.text();
+    return jsonError(`智谱 API 请求失败（${upstream.status}）: ${text}`, 502);
   }
 
-  if (!upstream!.ok || !upstream!.body) {
-    return jsonError(
-      `智谱 API 在重试 ${MAX_RETRIES} 次后仍失败（429）: ${lastError}`,
-      502,
-    );
-  }
-
-  const reader = upstream!.body!.getReader();
+  const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
 
