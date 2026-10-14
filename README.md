@@ -1,36 +1,99 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# AI 代码学习助手（AI Code Teacher）
 
-## Getting Started
+面向**编程零基础学生**的 AI 代码老师。粘贴代码或报错，AI 用通俗中文和生活类比，帮你逐行讲解、找 Bug、优化代码、出练习题。
 
-First, run the development server:
+本作品为「第九届传智杯全国大学生数智创新与 AI 应用大赛 — AI 创新应用挑战赛（Vibe Coding）」C 组参赛作品，采用 Vibe Coding 方式（AI 辅助编程 + 人工意图引导）开发。
+
+## 功能特性
+
+四种辅导模式，一键切换：
+
+- **逐行讲解**：拆解每一句代码的含义，用生活比喻解释
+- **找 Bug**：定位错误，说明原因，给出修复代码
+- **代码优化**：指出可改进之处，给出更规范的写法
+- **出练习题**：根据当前水平生成由易到难的练习题
+
+其他特性：
+
+- 基于 Monaco Editor 的代码编辑器（语法高亮、行号、自动缩进）
+- 支持 Java / Python / JavaScript / C / C++
+- AI 流式输出，回答实时呈现
+- 对话历史自动保存到本地（localStorage）
+- 接口限流时自动重试
+
+## 技术栈
+
+- **框架**：Next.js（App Router）+ React + TypeScript
+- **样式**：Tailwind CSS
+- **代码编辑器**：Monaco Editor（@monaco-editor/react）
+- **AI 模型**：智谱 GLM-4.7-Flash（通过服务端 API 调用）
+- **AI 编程工具**：Trae（Vibe Coding 过程）
+
+## 快速开始（10 分钟复现指南）
+
+### 1. 环境要求
+
+- Node.js 18.18 及以上版本（推荐 20 LTS）
+- 一个智谱 AI 的 API Key（在 [智谱开放平台](https://bigmodel.cn/) 注册后，于控制台获取）
+
+### 2. 安装依赖
+
+```bash
+npm install
+```
+
+### 3. 配置 API Key
+
+在项目根目录创建 `.env.local` 文件，写入你的 Key：
+
+```
+ZHIPU_API_KEY=你的智谱API Key
+```
+
+> 注意：`.env.local` 已在 `.gitignore` 中，不会被提交。
+
+### 4. 启动开发服务器
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+浏览器打开 [http://localhost:3000](http://localhost:3000)，即可使用。
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### 5. 构建生产版本（可选）
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npm run build
+npm start
+```
 
-## Learn More
+## 使用说明
 
-To learn more about Next.js, take a look at the following resources:
+1. 选择上方的辅导模式（如"逐行讲解"）
+2. 在左侧选择编程语言，粘贴代码
+3. 点击"发送"（或按 Ctrl / ⌘ + Enter）
+4. 在右侧查看 AI 回答
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## 项目结构
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```
+src/
+├── app/
+│   ├── page.tsx                 # 主页面
+│   ├── layout.tsx               # 根布局
+│   ├── globals.css              # 全局样式
+│   └── api/chat/route.ts        # 智谱 AI 接口（流式 + 重试）
+├── components/
+│   ├── CodeEditor.tsx           # Monaco 代码编辑器
+│   └── MarkdownMessage.tsx      # Markdown 渲染
+└── lib/
+    └── modes.ts                 # 四种模式与系统 Prompt
+```
 
-## Deploy on Vercel
+## 许可证
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+本项目采用 [MIT License](LICENSE) 开源许可。
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+Copyright © 2026 kinyicm
+
+允许学习、使用与修改，转载或使用请保留原作者署名。
