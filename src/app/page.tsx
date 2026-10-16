@@ -3,19 +3,35 @@
 import { useEffect, useRef, useState } from "react";
 import MarkdownMessage from "@/components/MarkdownMessage";
 import CodeEditor from "@/components/CodeEditor";
+import HistoryPanel from "@/components/HistoryPanel";
+import ErrorHandbook from "@/components/ErrorHandbook";
+import ModelSettings from "@/components/ModelSettings";
 import {
   MODES,
   MODE_LABEL,
   systemPromptFor,
+  WEAKNESS_ANALYSIS_PROMPT,
   type ModeId,
 } from "@/lib/modes";
 import { looksLikeErrorStack, parseJavaError } from "@/lib/errorParser";
+import {
+  classifyError,
+  buildOfflineAnswer,
+  KNOWLEDGE,
+  type OfflineMatch,
+} from "@/lib/errorKnowledge";
+import {
+  loadModelConfig,
+  saveModelConfig,
+  type ModelConfig,
+} from "@/lib/modelConfig";
 
 interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   content: string;
   mode: ModeId;
+  time?: string;
 }
 
 /**
@@ -29,11 +45,16 @@ async function streamChat(
   history: { role: "user" | "assistant"; content: string }[],
   signal: AbortSignal | undefined,
   onDelta: (full: string) => void,
+  modelConfig: ModelConfig,
+  systemPromptOverride?: string,
 ): Promise<{ ok: boolean; content: string; error?: string }> {
   // 组装：system + 历史（最近10条）+ 当前问题
   const recentHistory = history.slice(-10);
   const payloadMessages = [
-    { role: "system" as const, content: systemPromptFor(mode) },
+    {
+      role: "system" as const,
+      content: systemPromptOverride ?? systemPromptFor(mode),
+    },
     ...recentHistory,
     { role: "user" as const, content: userContent },
   ];
@@ -43,6 +64,14 @@ async function streamChat(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       messages: payloadMessages,
+      // 自定义模型时把配置传给 /api/chat 代理，默认智谱则不带（回退服务端环境变量）
+      ...(modelConfig.source === "custom"
+        ? {
+            baseUrl: modelConfig.baseUrl.trim() || undefined,
+            apiKey: modelConfig.apiKey.trim() || undefined,
+            model: modelConfig.model.trim() || undefined,
+          }
+        : {}),
     }),
     signal,
   });
@@ -127,6 +156,13 @@ export default function Home() {
   const [loaded, setLoaded] = useState(false);
   const [language, setLanguage] = useState("java");
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [handbookOpen, setHandbookOpen] = useState(false);
+  const [modelSettingsOpen, setModelSettingsOpen] = useState(false);
+  const [modelConfig, setModelConfig] = useState<ModelConfig>(() =>
+    loadModelConfig(),
+  );
+  const [notice, setNotice] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -138,7 +174,10 @@ export default function Home() {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
-        setMessages(JSON.parse(saved));
+        const parsed: unknown = JSON.parse(saved);
+        if (Array.isArray(parsed)) {
+          setMessages((parsed as ChatMessage[]).slice(-100));
+        }
       }
     } catch {
       // 数据损坏则忽略
@@ -146,11 +185,11 @@ export default function Home() {
     setLoaded(true);
   }, []);
 
-  // messages变化时保存到localStorage
+  // messages变化时保存到localStorage（最多保留100条）
   useEffect(() => {
     if (!loaded) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(messages.slice(-100)));
     } catch {
       // 存储满则忽略
     }
@@ -163,50 +202,47 @@ export default function Home() {
     });
   }, [messages, isThinking]);
 
-  async function handleSubmit() {
-    const content = input.trim();
-    if (!content || isThinking) return;
+  // 提示自动消失
+  useEffect(() => {
+    if (!notice) return;
+    const t = setTimeout(() => setNotice(null), 3000);
+    return () => clearTimeout(t);
+  }, [notice]);
 
-    // 报错堆栈智能解析：如果检测到 Java 异常，自动附加结构化摘要
-    let finalContent = content;
-    let parsedNote = "";
-    if (looksLikeErrorStack(content)) {
-      const parsed = parseJavaError(content);
-      if (parsed.isJavaStack && parsed.summary) {
-        parsedNote = parsed.summary;
-        finalContent = `【系统已自动识别为 Java 报错堆栈，解析结果如下】\n${parsed.summary}\n\n【原始报错】\n${content}\n\n请基于以上解析结果，用通俗语言解释这个错误的原因和修复方法。`;
-      }
-    }
-
-    // 构造历史对话：过滤掉空内容和错误提示，只保留 role + content
-    const history = messages
-      .filter(
-        (m) =>
-          m.content.trim() !== "" &&
-          !m.content.startsWith("> ⚠️") &&
-          !m.content.startsWith("> （"),
-      )
-      .map((m) => ({ role: m.role, content: m.content }));
+  // 发送一轮对话：追加用户消息 + 空 AI 气泡，流式填充，统一错误处理
+  async function runTurn(opts: {
+    userBubbleContent: string;
+    payloadContent: string;
+    history: { role: "user" | "assistant"; content: string }[];
+    systemPrompt?: string;
+  }) {
+    if (isThinking) return;
 
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: "user",
-      content,
+      content: opts.userBubbleContent,
       mode,
+      time: new Date().toISOString(),
     };
     const assistantId = crypto.randomUUID();
     const controller = new AbortController();
     abortRef.current = controller;
 
-    setMessages((prev) => [...prev, userMessage]);
-    setInput("");
+    setMessages((prev) => [...prev, userMessage].slice(-100));
     setIsThinking(true);
 
     // 先放入一个空的 AI 气泡，后续按流式增量填充内容
     setMessages((prev) => [
       ...prev,
-      { id: assistantId, role: "assistant", content: "", mode },
-    ]);
+      {
+        id: assistantId,
+        role: "assistant" as const,
+        content: "",
+        mode,
+        time: new Date().toISOString(),
+      },
+    ].slice(-100));
 
     const applyToAssistant = (content: string) => {
       setMessages((prev) =>
@@ -217,10 +253,12 @@ export default function Home() {
     try {
       const result = await streamChat(
         mode,
-        finalContent,
-        history,
+        opts.payloadContent,
+        opts.history,
         controller.signal,
         applyToAssistant,
+        modelConfig,
+        opts.systemPrompt,
       );
 
       if (!result.ok) {
@@ -254,6 +292,106 @@ export default function Home() {
     }
   }
 
+  // 离线解答：命中内置错误知识库时，不经 API 直接追加用户气泡 + 完整回答气泡
+  function appendOfflineReply(userBubbleContent: string, off: OfflineMatch) {
+    const k = KNOWLEDGE.find((item) => item.id === off.type);
+    if (!k) return;
+    const time = new Date().toISOString();
+    const userMessage: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "user",
+      content: userBubbleContent,
+      mode,
+      time,
+    };
+    const assistantMessage: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: "assistant",
+      content: buildOfflineAnswer(k, off.reason, off.lang),
+      mode,
+      time,
+    };
+    setMessages((prev) => [...prev, userMessage, assistantMessage].slice(-100));
+  }
+
+  async function handleSubmit() {
+    const content = input.trim();
+    if (!content || isThinking) return;
+
+    // 找 Bug 模式离线优先：命中内置错误知识库 → 本地直接解答，不调用 AI API
+    if (mode === "debug") {
+      const off = classifyError(content);
+      if (off) {
+        setInput("");
+        appendOfflineReply(content, off);
+        return;
+      }
+    }
+
+    // 报错堆栈智能解析：如果检测到 Java 异常，自动附加结构化摘要
+    let finalContent = content;
+    if (looksLikeErrorStack(content)) {
+      const parsed = parseJavaError(content);
+      if (parsed.isJavaStack && parsed.summary) {
+        finalContent = `【系统已自动识别为 Java 报错堆栈，解析结果如下】\n${parsed.summary}\n\n【原始报错】\n${content}\n\n请基于以上解析结果，用通俗语言解释这个错误的原因和修复方法。`;
+      }
+    }
+
+    // 构造历史对话：过滤掉空内容和错误提示，只保留 role + content
+    const history = messages
+      .filter(
+        (m) =>
+          m.content.trim() !== "" &&
+          !m.content.startsWith("> ⚠️") &&
+          !m.content.startsWith("> （"),
+      )
+      .map((m) => ({ role: m.role, content: m.content }));
+
+    setInput("");
+    await runTurn({
+      userBubbleContent: content,
+      payloadContent: finalContent,
+      history,
+    });
+  }
+
+  // 「分析薄弱点」：基于历史记录做个性化分析
+  function handleAnalyzeWeakness() {
+    if (isThinking) return;
+
+    const meaningful = messages
+      .filter(
+        (m) =>
+          m.content.trim() !== "" &&
+          !m.content.startsWith("> ⚠️") &&
+          !m.content.startsWith("> （"),
+      )
+      .slice(-20);
+
+    if (meaningful.length === 0) {
+      setNotice("还没有足够的历史对话，先发几条消息再来分析吧");
+      return;
+    }
+
+    const historyText = meaningful
+      .map(
+        (m) =>
+          `【${m.role === "user" ? "学生" : "AI 助手"} · ${MODE_LABEL[m.mode]}】\n${m.content}`,
+      )
+      .join("\n\n---\n\n");
+
+    const shortContent =
+      "📊 请根据我们的历史对话，分析我的薄弱环节并给出改进建议";
+    const payloadContent = `【分析请求】\n${shortContent}\n\n【我的历史对话记录】\n${historyText}\n\n请基于以上记录做个性化薄弱点分析。`;
+
+    void runTurn({
+      userBubbleContent: shortContent,
+      payloadContent,
+      history: [],
+      systemPrompt: WEAKNESS_ANALYSIS_PROMPT,
+    });
+  }
+
   function handleStop() {
     abortRef.current?.abort();
   }
@@ -266,6 +404,27 @@ export default function Home() {
     } catch {
       // 剪贴板不可用时忽略
     }
+  }
+
+  // 一键复制输入框内容
+  async function handleCopyInput() {
+    if (!input) return;
+    try {
+      await navigator.clipboard.writeText(input);
+      setNotice("输入内容已复制");
+    } catch {
+      setNotice("复制失败，请手动选择复制");
+    }
+  }
+
+  function handleDeleteMessage(id: string) {
+    setMessages((prev) => prev.filter((m) => m.id !== id));
+  }
+
+  function handleEditMessage(id: string, content: string) {
+    setMessages((prev) =>
+      prev.map((m) => (m.id === id ? { ...m, content } : m)),
+    );
   }
 
   return (
@@ -284,9 +443,34 @@ export default function Home() {
             </p>
           </div>
         </div>
-        <div className="hidden items-center gap-2 text-xs text-zinc-500 sm:flex">
-          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-          已接入智谱 AI · glm-4.7-flash
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => setHistoryOpen(true)}
+            className="flex items-center gap-2 rounded-lg border border-zinc-800 px-3 py-1.5 text-[13px] text-zinc-300 transition-colors hover:border-zinc-700 hover:bg-zinc-800/60 hover:text-zinc-100"
+          >
+            历史记录
+            <span className="rounded-full bg-zinc-800 px-1.5 py-0.5 text-[11px] tabular-nums text-zinc-400">
+              {messages.length}/100
+            </span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setModelSettingsOpen(true)}
+            title="选择默认智谱大模型，或粘贴自己的 OpenAI 兼容 API Key"
+            className="hidden items-center gap-2 rounded-lg border border-zinc-800 px-3 py-1.5 text-xs text-zinc-300 transition-colors hover:border-zinc-700 hover:bg-zinc-800/60 hover:text-zinc-100 sm:flex"
+          >
+            <span
+              className={`h-1.5 w-1.5 rounded-full ${
+                modelConfig.source === "custom"
+                  ? "bg-violet-400"
+                  : "bg-emerald-400"
+              }`}
+            />
+            {modelConfig.source === "custom"
+              ? `自定义模型 · ${modelConfig.model || "未命名"}`
+              : "默认 · glm-4.7-flash"}
+          </button>
         </div>
       </header>
 
@@ -309,6 +493,23 @@ export default function Home() {
             </button>
           );
         })}
+        <button
+          type="button"
+          onClick={handleAnalyzeWeakness}
+          disabled={isThinking}
+          title="根据历史对话分析薄弱点，帮助进步"
+          className="rounded-full border border-amber-500/40 bg-amber-500/10 px-3.5 py-1.5 text-[13px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          📊 分析薄弱点
+        </button>
+        <button
+          type="button"
+          onClick={() => setHandbookOpen(true)}
+          title="查看四种常见代码错误类型（语法/编译/运行时/逻辑）的离线知识库"
+          className="rounded-full border border-emerald-500/40 bg-emerald-500/10 px-3.5 py-1.5 text-[13px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/20"
+        >
+          📚 错误手册
+        </button>
         <p className="ml-auto hidden text-xs text-zinc-500 md:block">
           {activeMode.description}
         </p>
@@ -365,6 +566,14 @@ export default function Home() {
                 粘贴代码或描述报错，Ctrl / ⌘ + Enter 发送
               </p>
               <div className="flex shrink-0 gap-2">
+                <button
+                  type="button"
+                  onClick={handleCopyInput}
+                  disabled={!input}
+                  className="rounded-lg border border-zinc-800 px-3 py-1.5 text-[13px] text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  复制
+                </button>
                 <button
                   type="button"
                   onClick={() => setInput("")}
@@ -437,9 +646,19 @@ export default function Home() {
               message.role === "user" ? (
                 <div key={message.id} className="flex justify-end">
                   <div className="max-w-[85%] rounded-xl rounded-br-sm border border-indigo-500/25 bg-indigo-500/10 px-3.5 py-2.5">
-                    <p className="mb-1 text-[11px] text-indigo-300/80">
-                      {MODE_LABEL[message.mode]} · 你的输入
-                    </p>
+                    <div className="mb-1 flex items-center justify-between gap-3">
+                      <p className="text-[11px] text-indigo-300/80">
+                        {MODE_LABEL[message.mode]} · 你的输入
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => handleCopy(message.content, message.id)}
+                        disabled={!message.content.trim()}
+                        className="text-[11px] text-indigo-300/70 transition-colors hover:text-indigo-200 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {copiedId === message.id ? "已复制 ✓" : "复制"}
+                      </button>
+                    </div>
                     <pre className="font-mono text-[13px] leading-relaxed break-words whitespace-pre-wrap text-zinc-100">
                       {message.content}
                     </pre>
@@ -478,6 +697,48 @@ export default function Home() {
           </div>
         </section>
       </main>
+
+      {notice ? (
+        <div className="pointer-events-none fixed bottom-6 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-zinc-700 bg-zinc-800 px-4 py-2 text-sm text-zinc-200 shadow-lg">
+          {notice}
+        </div>
+      ) : null}
+
+      {historyOpen ? (
+        <HistoryPanel
+          records={messages}
+          onDelete={handleDeleteMessage}
+          onEdit={handleEditMessage}
+          onClose={() => setHistoryOpen(false)}
+        />
+      ) : null}
+
+      {handbookOpen ? (
+        <ErrorHandbook
+          onClose={() => setHandbookOpen(false)}
+          onPick={(lang, code) => {
+            setLanguage(lang);
+            setInput(code);
+            setHandbookOpen(false);
+          }}
+        />
+      ) : null}
+
+      {modelSettingsOpen ? (
+        <ModelSettings
+          current={modelConfig}
+          onSave={(config) => {
+            setModelConfig(config);
+            saveModelConfig(config);
+            setNotice(
+              config.source === "default"
+                ? "已恢复默认智谱大模型"
+                : "已保存自定义模型配置",
+            );
+          }}
+          onClose={() => setModelSettingsOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }
