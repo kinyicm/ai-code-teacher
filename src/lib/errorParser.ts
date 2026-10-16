@@ -50,6 +50,13 @@ function simpleName(full: string): string {
   return dot >= 0 ? full.slice(dot + 1) : full;
 }
 
+/** 判断方法所属的类是否属于 JDK 或常见库内部（这些帧一般不展示给学生作为出错点） */
+function isInternalMethod(method: string): boolean {
+  return /^(java\.|javax\.|jdk\.|sun\.|com\.sun\.|org\.gradle|kotlin\.|scala\.)/.test(
+    method,
+  );
+}
+
 export function parseJavaError(input: string): ParsedError {
   const text = input.trim();
   const result: ParsedError = {
@@ -58,11 +65,15 @@ export function parseJavaError(input: string): ParsedError {
     summary: "",
   };
 
-  // 识别 Java 异常：包含 "Exception" 或 "Error"，且有 "at " 堆栈行
-  const hasException = /\b(\w+\.)*(\w+Exception|\w+Error)\b/.test(text);
+  // 识别 Java 异常堆栈：
+  // - 堆栈行（"at 包.类.方法(...)"）或 "Exception in thread" 行，必然是真堆栈
+  // - 异常类型出现在行首（如 "java.lang.NullPointerException: xxx"），可视为异常输出
   const hasAtLine = /^\s*at\s+/m.test(text);
+  const hasThreadLine = /Exception in thread/.test(text);
+  const exceptionAtLineStart =
+    /^\s*(?:[\w$]+\.)*[\w$]+(?:Exception|Error)\s*(?::|$)/m.test(text);
 
-  if (!hasException && !hasAtLine) {
+  if (!hasAtLine && !hasThreadLine && !exceptionAtLineStart) {
     return result;
   }
 
@@ -93,9 +104,9 @@ export function parseJavaError(input: string): ParsedError {
     }
   }
 
-  // 提取堆栈位置：at 包名.类名.方法(文件:行号)
+  // 提取堆栈位置：at 包.类.方法(文件:行号)，类前缀兼容 Java 9+ 模块写法（如 java.base/java.lang.Integer）
   const atRegex =
-    /^\s*at\s+([\w$.]+)\.([\w$<>]+)\(([^:)]+)(?::(\d+))?\)/gm;
+    /^\s*at\s+([\w$./]+)\.([\w$<>]+)\(([^:)]+)(?::(\d+))?\)/gm;
   let m: RegExpExecArray | null;
   while ((m = atRegex.exec(text)) !== null) {
     result.locations.push({
@@ -117,11 +128,18 @@ export function parseJavaError(input: string): ParsedError {
     parts.push(`错误信息：${result.message}`);
   }
   if (result.locations.length > 0) {
-    const first = result.locations[0];
-    const loc = first.line
-      ? `${first.file} 第 ${first.line} 行`
-      : first.file;
-    parts.push(`出错位置：${loc}（方法 ${first.method ?? "未知"}）`);
+    // 优先展示用户自己代码中的出错帧，跳过 JDK/库内部帧，
+    // 避免把 "java.lang.NumberFormatException.forInputString" 这类内部方法当作出错点
+    const userFrame =
+      result.locations.find((l) => !isInternalMethod(l.method ?? "")) ??
+      result.locations[0];
+    const loc = userFrame.line
+      ? `${userFrame.file} 第 ${userFrame.line} 行`
+      : userFrame.file;
+    parts.push(`出错位置：${loc}（方法 ${userFrame.method ?? "未知"}）`);
+  }
+  if (/^\s*Caused by:/m.test(text)) {
+    parts.push("提示：该异常由更深层的原因引发（Caused by），根因在下面的异常链里");
   }
   if (result.thread) {
     parts.push(`发生线程：${result.thread}`);
