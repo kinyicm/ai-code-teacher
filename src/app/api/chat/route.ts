@@ -35,6 +35,13 @@ export const maxDuration = 60;
 const MODEL = "glm-4.7-flash";
 const API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
 
+/** 单次请求的消息条数上限：防止超大请求单次消耗大量额度 */
+const MAX_MESSAGES = 50;
+/** 单条消息 content 的最大字符数 */
+const MAX_CONTENT_LENGTH = 20000;
+/** 合法的消息角色 */
+const VALID_ROLES = new Set(["system", "user", "assistant"]);
+
 interface ChatMessage {
   role: "system" | "user" | "assistant";
   content: string;
@@ -52,6 +59,36 @@ function jsonError(message: string, status: number) {
     status,
     headers: { "Content-Type": "application/json; charset=utf-8" },
   });
+}
+
+/**
+ * 校验 messages 的结构与规模，防止单次请求消耗大量额度。
+ * 任一不满足返回中文错误（400），只指出第几条、哪个字段不合法，不回显用户内容：
+ * - 条数上限 MAX_MESSAGES
+ * - role 只能是 system / user / assistant
+ * - content 必须是 string，且不超过 MAX_CONTENT_LENGTH 字符
+ */
+function validateMessages(messages: unknown[]): string | null {
+  if (messages.length > MAX_MESSAGES) {
+    return `消息条数超过上限（最多 ${MAX_MESSAGES} 条，实际 ${messages.length} 条）`;
+  }
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (!msg || typeof msg !== "object") {
+      return `第 ${i + 1} 条消息不是合法的对象`;
+    }
+    const m = msg as { role?: unknown; content?: unknown };
+    if (typeof m.role !== "string" || !VALID_ROLES.has(m.role)) {
+      return `第 ${i + 1} 条消息 role 非法（只能是 system / user / assistant）`;
+    }
+    if (typeof m.content !== "string") {
+      return `第 ${i + 1} 条消息 content 必须是字符串`;
+    }
+    if (m.content.length > MAX_CONTENT_LENGTH) {
+      return `第 ${i + 1} 条消息 content 超过长度上限（最多 ${MAX_CONTENT_LENGTH} 字符）`;
+    }
+  }
+  return null;
 }
 
 /* ===== 公共额度限流：保护服务端内置 Key（默认模式）=====
@@ -76,10 +113,26 @@ interface RateBucket {
 }
 const rateBuckets = new Map<string, RateBucket>();
 
+/**
+ * 获取客户端 IP（用于按 IP 限流）。
+ * 只信任自有入口（Vercel 边缘 / 反向代理）会覆写的头，不信任客户端可写的第一段：
+ * - 优先 x-real-ip：由入口代理直接写入真实客户端 IP；
+ * - 否则取 x-forwarded-for 的【最后一段】——代理链中最靠近我们的入口追加的那段；
+ * - 取第一段等于完全信任客户端伪造值，攻击者每次换一个值即可绕过配额。
+ */
 function getClientIp(req: NextRequest): string {
+  const realIp = req.headers.get("x-real-ip")?.trim();
+  if (realIp) return realIp;
+
   const xff = req.headers.get("x-forwarded-for");
-  if (xff) return xff.split(",")[0].trim();
-  return req.headers.get("x-real-ip")?.trim() || "unknown";
+  if (xff) {
+    const parts = xff
+      .split(",")
+      .map((p) => p.trim())
+      .filter(Boolean);
+    if (parts.length > 0) return parts[parts.length - 1];
+  }
+  return "unknown";
 }
 
 /** 返回限流错误提示；未超限（或无需限流）返回 null */
@@ -134,6 +187,11 @@ export async function POST(req: NextRequest) {
   if (!Array.isArray(messages) || messages.length === 0) {
     return jsonError("请求体需要包含非空的 messages 数组", 400);
   }
+
+  // 结构与规模校验放在限流之前：非法/超大请求直接 400，不占用公共额度计数，
+  // 也不会打到上游模型消耗部署者 Key 的配额。
+  const messagesErr = validateMessages(messages);
+  if (messagesErr) return jsonError(messagesErr, 400);
 
   // 解析模型配置：使用者自带 Key 优先；未提供时使用服务端内置 Key（默认智谱，开箱即用）
   const clientKey = (body?.apiKey ?? "").trim();
