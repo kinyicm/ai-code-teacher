@@ -1,4 +1,14 @@
 import { NextRequest } from "next/server";
+import { validateCustomBaseUrl } from "@/lib/modelConfig";
+
+/**
+ * 最大执行时间（秒）：一次完整生成实测最长约 16 秒，取 60 秒留足余量，
+ * 覆盖高峰期模型响应变慢、网络抖动等情形，避免被 Vercel 默认的 10 秒
+ * 函数超时截断（返回 504）。
+ * 注意：这里只声明 maxDuration，不能显式声明 runtime —— 本项目
+ * next.config 开启了 cacheComponents，显式声明 runtime 会导致构建失败。
+ */
+export const maxDuration = 60;
 
 /**
  * 聊天补全接口（OpenAI 兼容 / 智谱 AI）
@@ -126,12 +136,28 @@ export async function POST(req: NextRequest) {
   }
 
   // 解析模型配置：使用者自带 Key 优先；未提供时使用服务端内置 Key（默认智谱，开箱即用）
-  const baseUrl = (body?.baseUrl ?? "").trim() || API_URL;
   const clientKey = (body?.apiKey ?? "").trim();
   const serverKey = process.env.ZHIPU_API_KEY || "";
   const apiKey = clientKey || serverKey;
   const usingServerKey = !clientKey; // 前端未带 Key，即走服务端内置 Key（默认模式）
-  const model = (body?.model ?? "").trim() || MODEL;
+
+  // 安全约束：
+  // 1. 使用服务端内置 Key 时，baseUrl/model 一律强制为默认智谱配置，客户端传值直接忽略，
+  //    杜绝内置 Key 的 Authorization 头发往客户端指定的地址（凭据外泄）。
+  // 2. 自定义 baseUrl 仅在客户端自带 Key 时允许，且必须 https + 域名白名单（防 SSRF）。
+  let baseUrl: string;
+  let model: string;
+  if (usingServerKey) {
+    baseUrl = API_URL;
+    model = MODEL;
+  } else {
+    const customErr = validateCustomBaseUrl(body?.baseUrl);
+    if (customErr) {
+      return jsonError(`自定义接口地址无效：${customErr}`, 400);
+    }
+    baseUrl = (body?.baseUrl ?? "").trim();
+    model = (body?.model ?? "").trim() || MODEL;
+  }
 
   // 公共额度限流：仅在走服务端内置 Key 时按 IP 限频，防止脚本批量盗刷；
   // 自带 Key 与本地开发不受限。

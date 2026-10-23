@@ -25,6 +25,36 @@ export const DEFAULT_MODEL_CONFIG: ModelConfig = {
 
 export const MODEL_STORAGE_KEY = "ai-code-teacher-model-config";
 
+/**
+ * 自定义模型接口域名白名单（仅 https）。
+ * 自定义 baseUrl 仅在用户自带 API Key 时允许使用，且域名必须在此白名单内，
+ * 防止 SSRF（请求内网/云元数据等地址）以及利用服务端内置 Key 做凭据外泄。
+ * 该列表是唯一来源：服务端 route.ts 与前端模型设置面板共用，新增服务商只需在此追加域名。
+ */
+export const ALLOWED_CUSTOM_HOSTS = new Set([
+  "api.openai.com", // OpenAI
+  "api.deepseek.com", // DeepSeek
+  "api.moonshot.cn", // Kimi / Moonshot
+  "dashscope.aliyuncs.com", // 阿里云百炼（通义）
+]);
+
+/** 校验自定义 baseUrl；合法返回 null，非法返回具体错误信息 */
+export function validateCustomBaseUrl(raw: string | undefined): string | null {
+  const value = (raw ?? "").trim();
+  if (!value) return "自定义模式必须提供接口地址（baseUrl）";
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return "不是合法的 URL";
+  }
+  if (url.protocol !== "https:") return "仅支持 https";
+  if (url.username || url.password) return "不允许包含账号密码";
+  if (url.port && url.port !== "443") return "不允许自定义端口";
+  if (!ALLOWED_CUSTOM_HOSTS.has(url.hostname)) return "不在允许的域名白名单内";
+  return null;
+}
+
 export function loadModelConfig(): ModelConfig {
   try {
     const raw = localStorage.getItem(MODEL_STORAGE_KEY);

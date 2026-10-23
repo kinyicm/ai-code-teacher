@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import {
   DEFAULT_MODEL_CONFIG,
+  validateCustomBaseUrl,
   type ModelConfig,
 } from "@/lib/modelConfig";
 
@@ -38,11 +39,16 @@ export default function ModelSettings({
   function handleSave() {
     if (source === "custom") {
       if (!baseUrl.trim()) {
-        setError("请填写接口地址（如 https://api.openai.com/v1/chat/completions）");
+        setError("请填写接口地址（如 https://api.deepseek.com/v1/chat/completions）");
         return;
       }
       if (!apiKey.trim()) {
         setError("请粘贴你的 API Key");
+        return;
+      }
+      const urlErr = validateCustomBaseUrl(baseUrl);
+      if (urlErr) {
+        setError(`接口地址无效：${urlErr}`);
         return;
       }
     }
@@ -114,7 +120,7 @@ export default function ModelSettings({
                   自定义 API（OpenAI 兼容）
                 </span>
                 <span className="block text-[11px] text-zinc-500">
-                  可接入 OpenAI / DeepSeek / Kimi 等任意兼容服务
+                  可接入 OpenAI / DeepSeek / Kimi / 阿里云百炼 等兼容服务（仅限白名单域名）
                 </span>
               </span>
             </label>
