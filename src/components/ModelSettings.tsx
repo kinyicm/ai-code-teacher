@@ -100,7 +100,7 @@ export default function ModelSettings({
               />
               <span>
                 <span className="block text-[13px] font-medium text-zinc-200">
-                  默认智谱大模型（glm-4.7-flash）
+                  默认智谱大模型（glm-4-flash）
                 </span>
                 <span className="block text-[11px] text-zinc-500">
                   无需任何配置，直接使用内置的智谱 AI
@@ -164,7 +164,7 @@ export default function ModelSettings({
                   type="text"
                   value={model}
                   onChange={(e) => setModel(e.target.value)}
-                  placeholder="gpt-4o-mini / glm-4.5-flash ..."
+                  placeholder="gpt-4o-mini / glm-4-flash ..."
                   className="w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] text-zinc-200 outline-none focus:border-violet-500/60"
                 />
               </div>

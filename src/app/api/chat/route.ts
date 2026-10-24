@@ -40,6 +40,10 @@ const API_URL =
   process.env.LLM_BASE_URL?.trim() ||
   "https://open.bigmodel.cn/api/paas/v4/chat/completions";
 
+/** 上游 429（模型过载）重试策略：最多重试 1 次、间隔 2 秒 */
+const MAX_RETRIES = 1;
+const RETRY_DELAY_MS = 2000;
+
 /** 单次请求的消息条数上限：防止超大请求单次消耗大量额度 */
 const MAX_MESSAGES = 50;
 /** 单条消息 content 的最大字符数 */
@@ -234,9 +238,9 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  let upstream: Response;
-  try {
-    upstream = await fetch(baseUrl, {
+  // 上游请求（首次调用与 429 重试复用）
+  const upstreamFetch = () =>
+    fetch(baseUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -253,6 +257,19 @@ export async function POST(req: NextRequest) {
       // Authorization，也不允许"凭外部返回决定服务器连哪里"。
       redirect: "manual",
     });
+
+  let upstream: Response;
+  try {
+    upstream = await upstreamFetch();
+
+    // 上游 429（模型过载）自动重试：仅对 429 重试，其他状态码（含 401）一律不重试。
+    // 重试必须发生在转发之前——拿到 2xx 之前绝不向客户端写任何 SSE 字节，
+    // 否则 HTTP 响应已提交，无法再重试或改状态码。
+    for (let attempt = 0; upstream.status === 429 && attempt < MAX_RETRIES; attempt++) {
+      await upstream.body?.cancel().catch(() => {}); // 丢弃首次 429 响应体，释放连接
+      await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+      upstream = await upstreamFetch();
+    }
   } catch (err) {
     const detail = err instanceof Error ? err.message : "网络错误";
     // 脱敏：任何错误信息都不允许带出 Key
@@ -270,6 +287,11 @@ export async function POST(req: NextRequest) {
       `模型接口返回了重定向（${upstream.status === 0 ? "3xx" : upstream.status}），出于安全考虑已拒绝跟随。请直接使用最终的接口地址`,
       502,
     );
+  }
+
+  // 重试后仍 429：是模型过载，不是用户请求有误
+  if (upstream.status === 429) {
+    return jsonError("模型接口当前访问量过大（HTTP 429），请稍后重试", 502);
   }
 
   if (!upstream.ok || !upstream.body) {

@@ -474,7 +474,7 @@ export default function Home() {
             />
             {modelConfig.source === "custom"
               ? `自定义模型 · ${modelConfig.model || "未命名"}`
-              : "默认 · glm-4.7-flash"}
+              : "默认 · glm-4-flash"}
           </button>
         </div>
       </header>
