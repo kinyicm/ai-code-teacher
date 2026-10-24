@@ -242,6 +242,11 @@ export async function POST(req: NextRequest) {
         messages,
         stream: true,
       }),
+      // 安全：不跟随任何 3xx 重定向（redirect: "manual" 保证 fetch 永不跳转，
+      // 再配合下面的显式拒绝分支）。白名单域名若被诱导返回 302 指向内网，跟随会
+      // 让服务器按外部返回的指令去探测内网；即使跨域重定向会按 Fetch 规范剥离
+      // Authorization，也不允许"凭外部返回决定服务器连哪里"。
+      redirect: "manual",
     });
   } catch (err) {
     const detail = err instanceof Error ? err.message : "网络错误";
@@ -249,6 +254,15 @@ export async function POST(req: NextRequest) {
     const safeDetail = apiKey ? detail.split(apiKey).join("***") : detail;
     return jsonError(
       `无法连接到模型接口（${baseUrl}）：${safeDetail}。请检查接口地址与网络连接`,
+      502,
+    );
+  }
+
+  // 显式拒绝重定向：manual 模式下 3xx 以响应形式返回（本运行时 status 仍为 302；
+  // 个别实现按规范给 opaque 响应 status=0），两种情况都绝不跟随并返回 502。
+  if (upstream.status === 0 || (upstream.status >= 300 && upstream.status < 400)) {
+    return jsonError(
+      `模型接口返回了重定向（${upstream.status === 0 ? "3xx" : upstream.status}），出于安全考虑已拒绝跟随。请直接使用最终的接口地址`,
       502,
     );
   }

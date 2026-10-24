@@ -36,6 +36,7 @@ export const ALLOWED_CUSTOM_HOSTS = new Set([
   "api.deepseek.com", // DeepSeek
   "api.moonshot.cn", // Kimi / Moonshot
   "dashscope.aliyuncs.com", // 阿里云百炼（通义）
+  "open.bigmodel.cn", // 智谱 AI（本项目默认服务商，允许自定义模式自带 Key 使用）
 ]);
 
 /** 校验自定义 baseUrl；合法返回 null，非法返回具体错误信息 */
