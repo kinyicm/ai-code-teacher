@@ -170,6 +170,10 @@ export default function Home() {
   const activeMode = MODES.find((item) => item.id === mode) ?? MODES[0];
 
   // 页面加载时从localStorage恢复对话
+  // 本 effect 内的同步 setState 属正当模式：localStorage 在服务端不存在，
+  // 若放进 useState 的初始化函数会导致 SSR 首屏与客户端首帧不一致（水合警告），
+  // 因此只能在 mount 后的 effect 里同步写入。故对本段定向关闭该规则。
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     try {
       const saved = localStorage.getItem(STORAGE_KEY);
@@ -184,6 +188,7 @@ export default function Home() {
     }
     setLoaded(true);
   }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   // messages变化时保存到localStorage（最多保留100条）
   useEffect(() => {
