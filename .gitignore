@@ -40,3 +40,5 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+# 对话导出原始文件（含明文 API Key，禁止入库；脱敏版见 docs/ai-log/）
+开发AI代码学习助手Web应用*.md
