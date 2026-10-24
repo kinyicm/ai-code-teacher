@@ -32,8 +32,13 @@ export const maxDuration = 60;
  *   data: [DONE]
  */
 
-const MODEL = "glm-4.7-flash";
-const API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions";
+// 默认模型与接口地址：可被环境变量覆盖。换模型 / 换服务商只需改 .env.local 里的
+// LLM_MODEL / LLM_BASE_URL，不必改代码；留空则用下方智谱默认值（开箱即用）。
+// 注意：这两个变量是服务端配置，与客户端可传的 baseUrl/apiKey 无关（见下方安全约束）。
+const MODEL = process.env.LLM_MODEL?.trim() || "glm-4-flash";
+const API_URL =
+  process.env.LLM_BASE_URL?.trim() ||
+  "https://open.bigmodel.cn/api/paas/v4/chat/completions";
 
 /** 单次请求的消息条数上限：防止超大请求单次消耗大量额度 */
 const MAX_MESSAGES = 50;
