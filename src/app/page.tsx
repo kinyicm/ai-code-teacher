@@ -6,6 +6,7 @@ import CodeEditor from "@/components/CodeEditor";
 import HistoryPanel from "@/components/HistoryPanel";
 import ErrorHandbook from "@/components/ErrorHandbook";
 import ModelSettings from "@/components/ModelSettings";
+import WeaknessAnalysis from "@/components/WeaknessAnalysis";
 import {
   MODES,
   MODE_LABEL,
@@ -148,11 +149,39 @@ function CodeIcon({ className }: { className?: string }) {
 
 const STORAGE_KEY = "ai-code-teacher-messages";
 
+function emptyMessages(): Record<ModeId, ChatMessage[]> {
+  return { explain: [], debug: [], optimize: [], practice: [] };
+}
+
+/** 全局最多保留 100 条对话：超出时从消息数最多的模式里丢弃最旧的一条 */
+function pruneAll(
+  record: Record<ModeId, ChatMessage[]>,
+): Record<ModeId, ChatMessage[]> {
+  const keys = Object.keys(record) as ModeId[];
+  const total = keys.reduce((n, k) => n + record[k].length, 0);
+  if (total <= 100) return record;
+  const next: Record<ModeId, ChatMessage[]> = { ...record };
+  let overflow = total - 100;
+  while (overflow > 0) {
+    const longest = keys.reduce((a, b) =>
+      next[a].length >= next[b].length ? a : b,
+    );
+    if (next[longest].length === 0) break;
+    next[longest] = next[longest].slice(1);
+    overflow--;
+  }
+  return next;
+}
+
 export default function Home() {
   const [mode, setMode] = useState<ModeId>("explain");
   const [input, setInput] = useState("");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [isThinking, setIsThinking] = useState(false);
+  // 每个模式独立维护自己的对话（各自独立的 AI 回答框），互不干扰
+  const [messagesByMode, setMessagesByMode] = useState<
+    Record<ModeId, ChatMessage[]>
+  >(() => emptyMessages());
+  // 当前正在流式生成的模式（null 表示空闲）
+  const [generatingMode, setGeneratingMode] = useState<ModeId | null>(null);
   const [loaded, setLoaded] = useState(false);
   const [language, setLanguage] = useState("java");
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -163,13 +192,42 @@ export default function Home() {
     loadModelConfig(),
   );
   const [notice, setNotice] = useState<string | null>(null);
+  // 薄弱点分析结果：以弹窗形式独立展示，不进入任一模式的对话流
+  const [weakness, setWeakness] = useState<{
+    id: string;
+    content: string;
+    isLoading: boolean;
+  } | null>(null);
 
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const scrollRefs = useRef<Partial<Record<ModeId, HTMLDivElement | null>>>({});
   const abortRef = useRef<AbortController | null>(null);
+  const weaknessAbortRef = useRef<AbortController | null>(null);
+
+  // 有任一模式正在生成即视为 isThinking（沿用历史逻辑）
+  const isThinking = generatingMode !== null;
+  // 当前模式的消息（渲染当前 AI 回答框）
+  const messages = messagesByMode[mode] ?? [];
+  // 所有模式消息合并（历史记录面板、薄弱点分析、顶部计数用）
+  const allMessages = Object.values(messagesByMode).flat();
+
+  /** 向指定模式追加消息（自动裁剪到全局 100 条上限） */
+  function appendToMode(modeId: ModeId, items: ChatMessage[]) {
+    setMessagesByMode((prev) =>
+      pruneAll({ ...prev, [modeId]: [...prev[modeId], ...items] }),
+    );
+  }
+
+  /** 流式更新指定模式里某条助手消息的内容 */
+  function patchAssistant(modeId: ModeId, id: string, content: string) {
+    setMessagesByMode((prev) => ({
+      ...prev,
+      [modeId]: prev[modeId].map((m) => (m.id === id ? { ...m, content } : m)),
+    }));
+  }
 
   const activeMode = MODES.find((item) => item.id === mode) ?? MODES[0];
 
-  // 页面加载时从localStorage恢复对话
+  // 页面加载时从localStorage恢复各模式对话
   // 本 effect 内的同步 setState 属正当模式：localStorage 在服务端不存在，
   // 若放进 useState 的初始化函数会导致 SSR 首屏与客户端首帧不一致（水合警告），
   // 因此只能在 mount 后的 effect 里同步写入。故对本段定向关闭该规则。
@@ -180,7 +238,22 @@ export default function Home() {
       if (saved) {
         const parsed: unknown = JSON.parse(saved);
         if (Array.isArray(parsed)) {
-          setMessages((parsed as ChatMessage[]).slice(-100));
+          // 旧格式（单一消息数组）：按每条消息的 mode 字段分到对应模式的对话
+          const grouped = emptyMessages();
+          for (const m of parsed as ChatMessage[]) {
+            const target = MODES.some((item) => item.id === m.mode)
+              ? m.mode
+              : "explain";
+            grouped[target].push(m);
+          }
+          setMessagesByMode(grouped);
+        } else if (parsed && typeof parsed === "object") {
+          const restored = emptyMessages();
+          for (const k of Object.keys(restored) as ModeId[]) {
+            const arr = (parsed as Record<string, unknown>)[k];
+            if (Array.isArray(arr)) restored[k] = arr as ChatMessage[];
+          }
+          setMessagesByMode(restored);
         }
       }
     } catch {
@@ -190,22 +263,22 @@ export default function Home() {
   }, []);
   /* eslint-enable react-hooks/set-state-in-effect */
 
-  // messages变化时保存到localStorage（最多保留100条）
+  // 消息变化时保存到localStorage（全局最多保留100条）
   useEffect(() => {
     if (!loaded) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(messages.slice(-100)));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(messagesByMode));
     } catch {
       // 存储满则忽略
     }
-  }, [messages, loaded]);
+  }, [messagesByMode, loaded]);
 
+  // 正在生成的模式（或当前模式）有新内容时滚动到底部
   useEffect(() => {
-    scrollRef.current?.scrollTo({
-      top: scrollRef.current.scrollHeight,
-      behavior: "smooth",
-    });
-  }, [messages, isThinking]);
+    const target = generatingMode ?? mode;
+    const el = scrollRefs.current[target];
+    el?.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  }, [messagesByMode, mode, generatingMode]);
 
   // 提示自动消失
   useEffect(() => {
@@ -234,12 +307,11 @@ export default function Home() {
     const controller = new AbortController();
     abortRef.current = controller;
 
-    setMessages((prev) => [...prev, userMessage].slice(-100));
-    setIsThinking(true);
+    appendToMode(mode, [userMessage]);
+    setGeneratingMode(mode);
 
     // 先放入一个空的 AI 气泡，后续按流式增量填充内容
-    setMessages((prev) => [
-      ...prev,
+    appendToMode(mode, [
       {
         id: assistantId,
         role: "assistant" as const,
@@ -247,12 +319,10 @@ export default function Home() {
         mode,
         time: new Date().toISOString(),
       },
-    ].slice(-100));
+    ]);
 
     const applyToAssistant = (content: string) => {
-      setMessages((prev) =>
-        prev.map((m) => (m.id === assistantId ? { ...m, content } : m)),
-      );
+      patchAssistant(mode, assistantId, content);
     };
 
     try {
@@ -274,8 +344,9 @@ export default function Home() {
     } catch (err) {
       // 用户主动中断：保留已生成内容，追加停止提示
       if (err instanceof DOMException && err.name === "AbortError") {
-        setMessages((prev) =>
-          prev.map((m) => {
+        setMessagesByMode((prev) => ({
+          ...prev,
+          [mode]: prev[mode].map((m) => {
             if (m.id !== assistantId) return m;
             const generated = m.content.trim();
             return {
@@ -285,14 +356,14 @@ export default function Home() {
                 : "_（已停止生成）_",
             };
           }),
-        );
+        }));
       } else {
         applyToAssistant(
           `> ⚠️ 网络错误：${err instanceof Error ? err.message : "未知错误"}`,
         );
       }
     } finally {
-      setIsThinking(false);
+      setGeneratingMode(null);
       abortRef.current = null;
     }
   }
@@ -316,7 +387,7 @@ export default function Home() {
       mode,
       time,
     };
-    setMessages((prev) => [...prev, userMessage, assistantMessage].slice(-100));
+    appendToMode(mode, [userMessage, assistantMessage]);
   }
 
   async function handleSubmit() {
@@ -360,11 +431,13 @@ export default function Home() {
     });
   }
 
-  // 「分析薄弱点」：基于历史记录做个性化分析
-  function handleAnalyzeWeakness() {
-    if (isThinking) return;
+  // 「分析薄弱点」：基于历史记录做个性化分析。
+  // 结果写入独立的 weakness 面板，不再追加到 AI 回答区的对话流。
+  async function handleAnalyzeWeakness() {
+    if (isThinking || weakness?.isLoading) return;
 
-    const meaningful = messages
+    // 基于所有模式的对话记录做分析，跨模式发现薄弱环节
+    const meaningful = allMessages
       .filter(
         (m) =>
           m.content.trim() !== "" &&
@@ -385,16 +458,59 @@ export default function Home() {
       )
       .join("\n\n---\n\n");
 
-    const shortContent =
-      "📊 请根据我们的历史对话，分析我的薄弱环节并给出改进建议";
-    const payloadContent = `【分析请求】\n${shortContent}\n\n【我的历史对话记录】\n${historyText}\n\n请基于以上记录做个性化薄弱点分析。`;
+    const payloadContent = `【分析请求】\n📊 请根据我们的历史对话，分析我的薄弱环节并给出改进建议\n\n【我的历史对话记录】\n${historyText}\n\n请基于以上记录做个性化薄弱点分析。`;
 
-    void runTurn({
-      userBubbleContent: shortContent,
-      payloadContent,
-      history: [],
-      systemPrompt: WEAKNESS_ANALYSIS_PROMPT,
-    });
+    const id = crypto.randomUUID();
+    setWeakness({ id, content: "", isLoading: true });
+
+    const controller = new AbortController();
+    weaknessAbortRef.current = controller;
+
+    const apply = (content: string) => {
+      setWeakness((cur) => (cur ? { ...cur, content } : cur));
+    };
+
+    try {
+      const result = await streamChat(
+        mode,
+        payloadContent,
+        [],
+        controller.signal,
+        apply,
+        modelConfig,
+        WEAKNESS_ANALYSIS_PROMPT,
+      );
+
+      if (!result.ok) {
+        apply(`> ⚠️ 请求失败：${result.error}`);
+      } else if (!result.content) {
+        apply("> （模型没有返回内容，请重试）");
+      }
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setWeakness((cur) =>
+          cur
+            ? {
+                ...cur,
+                content: cur.content.trim()
+                  ? `${cur.content}\n\n_（已停止分析）_`
+                  : "_（已停止分析）_",
+              }
+            : cur,
+        );
+      } else {
+        apply(
+          `> ⚠️ 网络错误：${err instanceof Error ? err.message : "未知错误"}`,
+        );
+      }
+    } finally {
+      weaknessAbortRef.current = null;
+      setWeakness((cur) => (cur ? { ...cur, isLoading: false } : cur));
+    }
+  }
+
+  function handleStopWeakness() {
+    weaknessAbortRef.current?.abort();
   }
 
   function handleStop() {
@@ -422,14 +538,30 @@ export default function Home() {
     }
   }
 
+  // 跨所有模式查找并删除指定消息
   function handleDeleteMessage(id: string) {
-    setMessages((prev) => prev.filter((m) => m.id !== id));
+    setMessagesByMode((prev) => {
+      const next: Record<ModeId, ChatMessage[]> = { ...prev };
+      for (const k of Object.keys(next) as ModeId[]) {
+        if (next[k].some((m) => m.id === id)) {
+          next[k] = next[k].filter((m) => m.id !== id);
+        }
+      }
+      return next;
+    });
   }
 
+  // 跨所有模式查找并编辑指定消息内容
   function handleEditMessage(id: string, content: string) {
-    setMessages((prev) =>
-      prev.map((m) => (m.id === id ? { ...m, content } : m)),
-    );
+    setMessagesByMode((prev) => {
+      const next: Record<ModeId, ChatMessage[]> = { ...prev };
+      for (const k of Object.keys(next) as ModeId[]) {
+        if (next[k].some((m) => m.id === id)) {
+          next[k] = next[k].map((m) => (m.id === id ? { ...m, content } : m));
+        }
+      }
+      return next;
+    });
   }
 
   return (
@@ -456,7 +588,7 @@ export default function Home() {
           >
             历史记录
             <span className="rounded-full bg-zinc-800 px-1.5 py-0.5 text-[11px] tabular-nums text-zinc-400">
-              {messages.length}/100
+              {allMessages.length}/100
             </span>
           </button>
           <button
@@ -488,6 +620,7 @@ export default function Home() {
               key={item.id}
               type="button"
               onClick={() => setMode(item.id)}
+              title={`切换到「${item.label}」页面（各自独立对话）`}
               className={`rounded-full px-3.5 py-1.5 text-[13px] font-medium transition-colors ${
                 active
                   ? "bg-indigo-500 text-white shadow-sm shadow-indigo-500/30"
@@ -495,13 +628,20 @@ export default function Home() {
               }`}
             >
               {item.label}
+              <span
+                className={`ml-1.5 rounded-full px-1.5 py-0.5 text-[10px] tabular-nums ${
+                  active ? "bg-white/20 text-white" : "bg-zinc-800 text-zinc-500"
+                }`}
+              >
+                {(messagesByMode[item.id] ?? []).length}
+              </span>
             </button>
           );
         })}
         <button
           type="button"
           onClick={handleAnalyzeWeakness}
-          disabled={isThinking}
+          disabled={isThinking || weakness?.isLoading}
           title="根据历史对话分析薄弱点，帮助进步"
           className="rounded-full border border-amber-500/40 bg-amber-500/10 px-3.5 py-1.5 text-[13px] font-medium text-amber-300 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-40"
         >
@@ -610,97 +750,117 @@ export default function Home() {
           </div>
         </section>
 
-        {/* 右侧：AI 回答区 */}
-        <section className="flex min-h-0 flex-1 flex-col rounded-xl border border-zinc-800 bg-zinc-900/40">
-          <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
-            <h2 className="text-sm font-medium text-zinc-300">AI 回答</h2>
-            <div className="flex items-center gap-3">
-              <span className="text-xs text-zinc-500">
-                {messages.length} 条对话
-              </span>
-              <button
-                type="button"
-                onClick={() => setMessages([])}
-                disabled={messages.length === 0}
-                className="text-xs text-zinc-500 transition-colors hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-40"
+        {/* 右侧：AI 回答区 —— 每个模式一个独立页面，各自独立的回答框与对话 */}
+        {MODES.map((item) => {
+          const active = item.id === mode;
+          const msgs = messagesByMode[item.id] ?? [];
+          const thinking = generatingMode === item.id;
+          return (
+            <section
+              key={item.id}
+              className={`min-h-0 flex-1 flex-col rounded-xl border border-zinc-800 bg-zinc-900/40 ${
+                active ? "flex" : "hidden"
+              }`}
+            >
+              <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
+                <h2 className="text-sm font-medium text-zinc-300">
+                  AI 回答 · {MODE_LABEL[item.id]}
+                </h2>
+                <div className="flex items-center gap-3">
+                  <span className="text-xs text-zinc-500">
+                    {msgs.length} 条对话
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setMessagesByMode((prev) => ({ ...prev, [item.id]: [] }))
+                    }
+                    disabled={msgs.length === 0}
+                    className="text-xs text-zinc-500 transition-colors hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    清空对话
+                  </button>
+                </div>
+              </div>
+
+              <div
+                ref={(el) => {
+                  scrollRefs.current[item.id] = el;
+                }}
+                className="scroll-area flex-1 space-y-4 overflow-y-auto px-4 py-4"
               >
-                清空对话
-              </button>
-            </div>
-          </div>
-
-          <div
-            ref={scrollRef}
-            className="scroll-area flex-1 space-y-4 overflow-y-auto px-4 py-4"
-          >
-            {messages.length === 0 && !isThinking ? (
-              <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
-                <div className="grid h-12 w-12 place-items-center rounded-xl bg-zinc-800/60 text-zinc-500">
-                  <CodeIcon className="h-6 w-6" />
-                </div>
-                <div>
-                  <p className="text-sm text-zinc-300">还没有对话</p>
-                  <p className="mt-1 text-xs text-zinc-500">
-                    选择上方模式，在左侧粘贴代码或描述报错，点击「发送」开始
-                  </p>
-                </div>
-              </div>
-            ) : null}
-
-            {messages.map((message) =>
-              message.role === "user" ? (
-                <div key={message.id} className="flex justify-end">
-                  <div className="max-w-[85%] rounded-xl rounded-br-sm border border-indigo-500/25 bg-indigo-500/10 px-3.5 py-2.5">
-                    <div className="mb-1 flex items-center justify-between gap-3">
-                      <p className="text-[11px] text-indigo-300/80">
-                        {MODE_LABEL[message.mode]} · 你的输入
-                      </p>
-                      <button
-                        type="button"
-                        onClick={() => handleCopy(message.content, message.id)}
-                        disabled={!message.content.trim()}
-                        className="text-[11px] text-indigo-300/70 transition-colors hover:text-indigo-200 disabled:cursor-not-allowed disabled:opacity-40"
-                      >
-                        {copiedId === message.id ? "已复制 ✓" : "复制"}
-                      </button>
+                {msgs.length === 0 && !thinking ? (
+                  <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+                    <div className="grid h-12 w-12 place-items-center rounded-xl bg-zinc-800/60 text-zinc-500">
+                      <CodeIcon className="h-6 w-6" />
                     </div>
-                    <pre className="font-mono text-[13px] leading-relaxed break-words whitespace-pre-wrap text-zinc-100">
-                      {message.content}
-                    </pre>
+                    <div>
+                      <p className="text-sm text-zinc-300">
+                        「{MODE_LABEL[item.id]}」还没有对话
+                      </p>
+                      <p className="mt-1 text-xs text-zinc-500">
+                        {item.description}，在左侧输入后点击「发送」
+                      </p>
+                    </div>
                   </div>
-                </div>
-              ) : (
-                <div
-                  key={message.id}
-                  className="rounded-xl border border-zinc-800 bg-zinc-950/50 px-4 py-3.5"
-                >
-                  <div className="mb-2 flex items-center justify-between">
-                    <p className="flex items-center gap-2 text-[11px] text-zinc-500">
-                      <span className="h-1.5 w-1.5 rounded-full bg-indigo-400" />
-                      AI 助手 · {MODE_LABEL[message.mode]}
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => handleCopy(message.content, message.id)}
-                      disabled={!message.content.trim()}
-                      className="text-[11px] text-zinc-500 transition-colors hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-40"
-                    >
-                      {copiedId === message.id ? "已复制 ✓" : "复制"}
-                    </button>
-                  </div>
-                  <MarkdownMessage content={message.content} />
-                </div>
-              ),
-            )}
+                ) : null}
 
-            {isThinking ? (
-              <div className="flex items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-950/50 px-4 py-3.5 text-sm text-zinc-400">
-                <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-indigo-400" />
-                正在生成回答…
+                {msgs.map((message) =>
+                  message.role === "user" ? (
+                    <div key={message.id} className="flex justify-end">
+                      <div className="max-w-[85%] rounded-xl rounded-br-sm border border-indigo-500/25 bg-indigo-500/10 px-3.5 py-2.5">
+                        <div className="mb-1 flex items-center justify-between gap-3">
+                          <p className="text-[11px] text-indigo-300/80">
+                            {MODE_LABEL[message.mode]} · 你的输入
+                          </p>
+                          <button
+                            type="button"
+                            onClick={() => handleCopy(message.content, message.id)}
+                            disabled={!message.content.trim()}
+                            className="text-[11px] text-indigo-300/70 transition-colors hover:text-indigo-200 disabled:cursor-not-allowed disabled:opacity-40"
+                          >
+                            {copiedId === message.id ? "已复制 ✓" : "复制"}
+                          </button>
+                        </div>
+                        <pre className="font-mono text-[13px] leading-relaxed break-words whitespace-pre-wrap text-zinc-100">
+                          {message.content}
+                        </pre>
+                      </div>
+                    </div>
+                  ) : (
+                    <div
+                      key={message.id}
+                      className="rounded-xl border border-zinc-800 bg-zinc-950/50 px-4 py-3.5"
+                    >
+                      <div className="mb-2 flex items-center justify-between">
+                        <p className="flex items-center gap-2 text-[11px] text-zinc-500">
+                          <span className="h-1.5 w-1.5 rounded-full bg-indigo-400" />
+                          AI 助手 · {MODE_LABEL[message.mode]}
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => handleCopy(message.content, message.id)}
+                          disabled={!message.content.trim()}
+                          className="text-[11px] text-zinc-500 transition-colors hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-40"
+                        >
+                          {copiedId === message.id ? "已复制 ✓" : "复制"}
+                        </button>
+                      </div>
+                      <MarkdownMessage content={message.content} />
+                    </div>
+                  ),
+                )}
+
+                {thinking ? (
+                  <div className="flex items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-950/50 px-4 py-3.5 text-sm text-zinc-400">
+                    <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-indigo-400" />
+                    正在生成回答…
+                  </div>
+                ) : null}
               </div>
-            ) : null}
-          </div>
-        </section>
+            </section>
+          );
+        })}
       </main>
 
       {notice ? (
@@ -709,9 +869,22 @@ export default function Home() {
         </div>
       ) : null}
 
+      {weakness ? (
+        <WeaknessAnalysis
+          id={weakness.id}
+          content={weakness.content}
+          isLoading={weakness.isLoading}
+          onClose={() => {
+            weaknessAbortRef.current?.abort();
+            setWeakness(null);
+          }}
+          onStop={handleStopWeakness}
+        />
+      ) : null}
+
       {historyOpen ? (
         <HistoryPanel
-          records={messages}
+          records={allMessages}
           onDelete={handleDeleteMessage}
           onEdit={handleEditMessage}
           onClose={() => setHistoryOpen(false)}

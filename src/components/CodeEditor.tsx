@@ -1,6 +1,19 @@
 "use client";
 
-import Editor from "@monaco-editor/react";
+import Editor, { loader } from "@monaco-editor/react";
+
+// 将 Monaco 界面本地化为中文（右键菜单里的复制/剪切/粘贴、命令面板等）。
+// 必须在编辑器加载前设置；@monaco-editor/react 默认从 CDN 加载 monaco。
+// 版本固定为 0.52.2：0.55.1 的 min 包里 zh-cn 翻译文件打包异常（文件名和模块 id
+// 都多了一个 .js 后缀），会导致中文语言包 404、编辑器无法初始化。
+loader.config({
+  paths: {
+    vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs",
+  },
+  "vs/nls": {
+    availableLanguages: { "*": "zh-cn" },
+  },
+});
 
 interface CodeEditorProps {
   value: string;
