@@ -51,6 +51,14 @@ export default function ModelSettings({
         setError(`接口地址无效：${urlErr}`);
         return;
       }
+      // 模型名必填：各家服务商的模型名互不相同，留空若回落到默认值（glm-4-flash），
+      // 发给 OpenAI / DeepSeek 只会得到一个看不懂的上游报错。
+      if (!model.trim()) {
+        setError(
+          "请填写模型名 —— 各服务商不同，例如 gpt-4o-mini / deepseek-chat / glm-4-flash",
+        );
+        return;
+      }
     }
     setError("");
     onSave({
@@ -95,7 +103,10 @@ export default function ModelSettings({
                 type="radio"
                 name="model-source"
                 checked={source === "default"}
-                onChange={() => setSource("default")}
+                onChange={() => {
+                  setSource("default");
+                  setError("");
+                }}
                 className="mt-1 accent-emerald-500"
               />
               <span>
@@ -112,7 +123,10 @@ export default function ModelSettings({
                 type="radio"
                 name="model-source"
                 checked={source === "custom"}
-                onChange={() => setSource("custom")}
+                onChange={() => {
+                  setSource("custom");
+                  setError("");
+                }}
                 className="mt-1 accent-violet-500"
               />
               <span>
@@ -136,7 +150,10 @@ export default function ModelSettings({
                 <input
                   type="text"
                   value={baseUrl}
-                  onChange={(e) => setBaseUrl(e.target.value)}
+                  onChange={(e) => {
+                    setBaseUrl(e.target.value);
+                    setError("");
+                  }}
                   placeholder="https://api.openai.com/v1/chat/completions"
                   className="w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] text-zinc-200 outline-none focus:border-violet-500/60"
                 />
@@ -148,7 +165,10 @@ export default function ModelSettings({
                 <input
                   type="password"
                   value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
+                  onChange={(e) => {
+                    setApiKey(e.target.value);
+                    setError("");
+                  }}
                   placeholder="sk-..."
                   className="w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] text-zinc-200 outline-none focus:border-violet-500/60"
                 />
@@ -163,7 +183,10 @@ export default function ModelSettings({
                 <input
                   type="text"
                   value={model}
-                  onChange={(e) => setModel(e.target.value)}
+                  onChange={(e) => {
+                    setModel(e.target.value);
+                    setError("");
+                  }}
                   placeholder="gpt-4o-mini / glm-4-flash ..."
                   className="w-full rounded-md border border-zinc-800 bg-zinc-950 px-3 py-2 text-[13px] text-zinc-200 outline-none focus:border-violet-500/60"
                 />
