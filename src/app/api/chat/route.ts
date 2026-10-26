@@ -232,8 +232,16 @@ export async function POST(req: NextRequest) {
   if (limitError) return jsonError(limitError, 429);
 
   if (!apiKey) {
+    // 首启最常见的卡点：新用户没看 README，直接点发送。
+    // 这里必须给出「照做就能成功」的两条具体路径，而不是一句「去模型设置粘贴」——
+    // 模型设置里的自定义模式是给第三方服务商用的，只填 Key 不填地址与模型名仍会失败。
     return jsonError(
-      "未配置 API Key：请在页面右上角「模型设置」中粘贴你自己的 API Key，或在服务端配置 ZHIPU_API_KEY",
+      [
+        "尚未配置 API Key，两种方式任选其一：",
+        "① 服务端配置（推荐）：在项目根目录创建 .env.local，写入 ZHIPU_API_KEY=你的Key，然后重启服务；",
+        "② 页面配置：右上角「模型设置」→ 自定义 API，接口地址填 https://open.bigmodel.cn/api/paas/v4/chat/completions ，API Key 填智谱 Key，模型名填 glm-4-flash。",
+        "Key 可在 bigmodel.cn 注册后免费领取（新用户有免费额度）。",
+      ].join("\n"),
       400,
     );
   }

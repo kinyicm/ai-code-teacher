@@ -192,6 +192,11 @@ export default function Home() {
     loadModelConfig(),
   );
   const [notice, setNotice] = useState<string | null>(null);
+  // 首屏探测服务端是否已配置模型密钥：null 表示尚未探测完成。
+  // 未配置时在顶部给出配置指引，避免新用户点了发送才看到报错。
+  const [keyConfigured, setKeyConfigured] = useState<boolean | null>(null);
+  // 服务端实际生效的默认模型名（可能被 LLM_MODEL 覆盖），用于顶部显示，避免写死
+  const [effectiveModel, setEffectiveModel] = useState("");
   // 薄弱点分析结果：以弹窗形式独立展示，不进入任一模式的对话流
   const [weakness, setWeakness] = useState<{
     id: string;
@@ -209,6 +214,25 @@ export default function Home() {
   const messages = messagesByMode[mode] ?? [];
   // 所有模式消息合并（历史记录面板、薄弱点分析、顶部计数用）
   const allMessages = Object.values(messagesByMode).flat();
+
+  // 首屏探测服务端配置。放在 promise 回调里更新状态（非同步 setState），
+  // 因此不触发 react-hooks/set-state-in-effect。
+  useEffect(() => {
+    let alive = true;
+    fetch("/api/health", { cache: "no-store" })
+      .then((r) => r.json())
+      .then((d: { keyConfigured?: boolean; model?: string }) => {
+        if (!alive) return;
+        setKeyConfigured(Boolean(d.keyConfigured));
+        setEffectiveModel(typeof d.model === "string" ? d.model : "");
+      })
+      .catch(() => {
+        if (alive) setKeyConfigured(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   /** 向指定模式追加消息（自动裁剪到全局 100 条上限） */
   function appendToMode(modeId: ModeId, items: ChatMessage[]) {
@@ -606,10 +630,61 @@ export default function Home() {
             />
             {modelConfig.source === "custom"
               ? `自定义模型 · ${modelConfig.model || "未命名"}`
-              : "默认 · glm-4-flash"}
+              : `默认 · ${effectiveModel || "glm-4-flash"}`}
           </button>
         </div>
       </header>
+
+      {keyConfigured === false ? (
+        <div className="flex flex-wrap items-start gap-3 border-b border-amber-500/30 bg-amber-500/10 px-5 py-3">
+          <span aria-hidden className="mt-0.5 text-base leading-none">
+            ⚠️
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="text-[13px] font-medium text-amber-100">
+              尚未配置 API Key —— 配置后即可开始使用
+            </p>
+            <ol className="mt-1 list-decimal space-y-1 pl-5 text-[12px] leading-relaxed text-amber-200/90">
+              <li>
+                在项目根目录创建{" "}
+                <code className="rounded bg-black/30 px-1">.env.local</code>
+                ，写入{" "}
+                <code className="rounded bg-black/30 px-1">
+                  ZHIPU_API_KEY=你的Key
+                </code>
+                ，然后重启服务
+              </li>
+              <li>
+                或点右上角「模型设置」→ 自定义 API：接口地址填{" "}
+                <code className="rounded bg-black/30 px-1">
+                  https://open.bigmodel.cn/api/paas/v4/chat/completions
+                </code>
+                ，模型名填{" "}
+                <code className="rounded bg-black/30 px-1">glm-4-flash</code>
+              </li>
+              <li>
+                Key 可在{" "}
+                <a
+                  href="https://bigmodel.cn/"
+                  target="_blank"
+                  rel="noreferrer"
+                  className="underline underline-offset-2"
+                >
+                  bigmodel.cn
+                </a>{" "}
+                免费领取，新用户有免费额度
+              </li>
+            </ol>
+          </div>
+          <button
+            type="button"
+            onClick={() => setModelSettingsOpen(true)}
+            className="shrink-0 rounded-lg border border-amber-500/40 px-3 py-1.5 text-[12px] text-amber-100 transition-colors hover:bg-amber-500/20"
+          >
+            去设置
+          </button>
+        </div>
+      ) : null}
 
       <div className="flex flex-wrap items-center gap-2 border-b border-zinc-800/80 px-5 py-3">
         <span className="mr-1 text-xs text-zinc-500">模式</span>
