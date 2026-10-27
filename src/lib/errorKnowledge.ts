@@ -131,11 +131,12 @@ int main(void) {
       "把结果和手算的期望值对比，缩小出错范围",
     ],
     fixExample: {
-      lang: "javascript",
-      code: `const arr = [10, 20, 30];
-// 用 < 而不是 <=，避免多访问一次（第 4 次 arr[3] 是 undefined）
-for (let i = 0; i < arr.length; i++) {
-  console.log(arr[i]);
+      lang: "java",
+      code: `int[] arr = {10, 20, 30};
+// 用 i < arr.length 而不是 i <= arr.length：
+// 后者会多访问一次，第 4 次取 arr[3] 直接抛数组越界
+for (int i = 0; i < arr.length; i++) {
+    System.out.println(arr[i]);
 }`,
     },
     practiceHint: "把循环条件改成 i <= arr.length，看看多出的那一行输出是什么。",

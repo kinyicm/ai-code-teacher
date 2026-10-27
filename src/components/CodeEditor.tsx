@@ -34,9 +34,11 @@ interface CodeEditorProps {
   onReady?: (handle: CodeEditorHandle) => void;
 }
 
-/** 暴露给父组件的编辑器滚动控制接口（用于与 AI 回答区同步滚动） */
+/** 暴露给父组件的编辑器控制接口（用于与 AI 回答区同步滚动 / 点击行跳转讲解） */
 export interface CodeEditorHandle {
   onDidScrollChange(cb: (e: { scrollTop: number }) => void): void;
+  /** 鼠标点击某行时回调行号（reason=5 即 MOUSE），用于跳转到对应讲解 */
+  onDidChangeCursorPosition(cb: (line: number) => void): void;
   getScrollTop(): number;
   setScrollTop(top: number): void;
   getScrollHeight(): number;
@@ -61,9 +63,26 @@ export default function CodeEditor({
         run: () => onSubmit(),
       });
     }
-    // 暴露滚动控制接口，供页面做左右区域滚动同步
+    // 暴露控制接口，供页面做左右区域同步滚动 / 点击代码行跳转到对应讲解
     if (onReady) {
-      onReady(editor as unknown as CodeEditorHandle);
+      const handle: CodeEditorHandle = {
+        onDidScrollChange: (cb) => {
+          editor.onDidScrollChange(cb);
+        },
+        // 点击某行时回调行号，用于回答区跳转对应讲解：
+        // 排除内容编辑（reason=1，打字）与键盘移动（reason=6，方向键翻页），
+        // 其余（鼠标点击=5、显式定位=2 等）视为点击行
+        onDidChangeCursorPosition: (cb) => {
+          editor.onDidChangeCursorPosition((e) => {
+            if (e.reason !== 1 && e.reason !== 6) cb(e.position.lineNumber);
+          });
+        },
+        getScrollTop: () => editor.getScrollTop(),
+        setScrollTop: (top) => editor.setScrollTop(top),
+        getScrollHeight: () => editor.getScrollHeight(),
+        getLayoutInfo: () => editor.getLayoutInfo(),
+      };
+      onReady(handle);
     }
   };
 

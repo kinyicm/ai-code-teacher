@@ -26,6 +26,7 @@ import {
   saveModelConfig,
   type ModelConfig,
 } from "@/lib/modelConfig";
+import { detectLanguage, LANG_LABEL } from "@/lib/languageDetect";
 
 interface ChatMessage {
   id: string;
@@ -51,10 +52,21 @@ async function streamChat(
 ): Promise<{ ok: boolean; content: string; error?: string }> {
   // 组装：system + 历史（最近10条）+ 当前问题
   const recentHistory = history.slice(-10);
+
+  // 语言上下文：由程序判定输入代码的语言，并明确要求模型沿用同一语言。
+  // 原先只靠模型自己猜，实测出现过「Java 代码的修复示例给成 JavaScript」，
+  // 而「判断语言」本就该由程序完成（见 lib/languageDetect.ts），不应交给模型。
+  const detected = detectLanguage(userContent);
+  const basePrompt = systemPromptOverride ?? systemPromptFor(mode);
+  const finalSystemPrompt = detected
+    ? `${basePrompt}\n\n【代码语言】用户当前的代码是 ${LANG_LABEL[detected]}。` +
+      `所有代码示例（尤其是修复示例）必须使用 ${LANG_LABEL[detected]}，不要换成其他语言。`
+    : basePrompt;
+
   const payloadMessages = [
     {
       role: "system" as const,
-      content: systemPromptOverride ?? systemPromptFor(mode),
+      content: finalSystemPrompt,
     },
     ...recentHistory,
     { role: "user" as const, content: userContent },
@@ -215,13 +227,21 @@ export default function Home() {
   const codeEditorRef = useRef<CodeEditorHandle | null>(null);
   // 同步滚动时的防抖锁：程序性滚动触发的事件跳过，避免互相回写造成抖动
   const syncingRef = useRef(false);
+  // 用户是否已主动离开底部向上浏览：为 true 时生成新内容不再强拉回底部，
+  // 让用户在 AI 生成期间可以自由浏览回答区
+  const userScrolledAwayRef = useRef(false);
 
   // 有任一模式正在生成即视为 isThinking（沿用历史逻辑）
   const isThinking = generatingMode !== null;
-  // 当前模式的消息（渲染当前 AI 回答框）
+  // 当前模式的消息（渲染当前 AI 回答框）：仅当前会话，打开页面时为空
   const messages = messagesByMode[mode] ?? [];
-  // 所有模式消息合并（历史记录面板、薄弱点分析、顶部计数用）
-  const allMessages = Object.values(messagesByMode).flat();
+  // 跨会话持久化归档的历史：localStorage 只保存这份，回答区不恢复旧对话
+  const [historyByMode, setHistoryByMode] = useState<
+    Record<ModeId, ChatMessage[]>
+  >(() => emptyMessages());
+  // 全部历史合并（历史记录面板、薄弱点分析、顶部计数用）：
+  // 跨会话持久化归档，打开页面时旧对话只留在历史记录里
+  const allMessages = Object.values(historyByMode).flat();
 
   // 首屏探测服务端配置。放在 promise 回调里更新状态（非同步 setState），
   // 因此不触发 react-hooks/set-state-in-effect。
@@ -242,19 +262,27 @@ export default function Home() {
     };
   }, []);
 
-  /** 向指定模式追加消息（自动裁剪到全局 100 条上限） */
+  /** 向指定模式追加消息：回答区（当前会话）与历史归档（持久化）同步追加 */
   function appendToMode(modeId: ModeId, items: ChatMessage[]) {
-    setMessagesByMode((prev) =>
+    // 回答区：只保留本次打开页面后的当前会话
+    setMessagesByMode((prev) => ({
+      ...prev,
+      [modeId]: [...prev[modeId], ...items],
+    }));
+    // 历史归档：跨会话累积，全局最多保留 100 条
+    setHistoryByMode((prev) =>
       pruneAll({ ...prev, [modeId]: [...prev[modeId], ...items] }),
     );
   }
 
-  /** 流式更新指定模式里某条助手消息的内容 */
+  /** 流式更新指定模式里某条助手消息的内容（回答区与历史归档同步） */
   function patchAssistant(modeId: ModeId, id: string, content: string) {
-    setMessagesByMode((prev) => ({
+    const upd = (prev: Record<ModeId, ChatMessage[]>) => ({
       ...prev,
       [modeId]: prev[modeId].map((m) => (m.id === id ? { ...m, content } : m)),
-    }));
+    });
+    setMessagesByMode(upd);
+    setHistoryByMode(upd);
   }
 
   // ---------- 代码区与 AI 回答区同步滚动 ----------
@@ -292,6 +320,9 @@ export default function Home() {
     const source = activeAnswerEl();
     const ed = codeEditorRef.current;
     if (!source || !ed) return;
+    // 记录用户浏览位置：离开底部视为主动向上浏览，生成时不再强拉回底部
+    userScrolledAwayRef.current =
+      source.scrollHeight - source.scrollTop - source.clientHeight > 60;
     const aMax = Math.max(source.scrollHeight - source.clientHeight, 0);
     if (aMax <= 0) return;
     const ratio = Math.min(Math.max(source.scrollTop / aMax, 0), 1);
@@ -302,9 +333,36 @@ export default function Home() {
     syncingRef.current = false;
   }
 
+  /** 点击代码行 → 在 AI 回答区定位并滚动到对应行的讲解（锚点「第 N 行」） */
+  function scrollAnswerToLine(line: number) {
+    const el = activeAnswerEl();
+    if (!el) return;
+    // 在回答区查找包含「第 N 行」的讲解块（标题/段落/列表项）
+    const targets = el.querySelectorAll("h1,h2,h3,p,li");
+    let anchor: Element | null = null;
+    for (const t of targets) {
+      const text = t.textContent ?? "";
+      if (new RegExp(`第\\s*${line}\\s*行`).test(text) && text.length < 200) {
+        anchor = t;
+        break;
+      }
+    }
+    if (!anchor) return;
+    // 跳转后视为用户离开底部，生成中不再被拉回；锁住避免与同步滚动互相回写
+    userScrolledAwayRef.current = true;
+    syncingRef.current = true;
+    el.scrollTop =
+      anchor.getBoundingClientRect().top -
+      el.getBoundingClientRect().top +
+      el.scrollTop -
+      8;
+    syncingRef.current = false;
+  }
+
   const activeMode = MODES.find((item) => item.id === mode) ?? MODES[0];
 
-  // 页面加载时从localStorage恢复各模式对话
+  // 页面加载时从localStorage恢复「历史归档」到 historyByMode，
+  // 不恢复到回答区（messagesByMode 保持空，回答区每次打开都是全新的会话）
   // 本 effect 内的同步 setState 属正当模式：localStorage 在服务端不存在，
   // 若放进 useState 的初始化函数会导致 SSR 首屏与客户端首帧不一致（水合警告），
   // 因此只能在 mount 后的 effect 里同步写入。故对本段定向关闭该规则。
@@ -323,14 +381,14 @@ export default function Home() {
               : "explain";
             grouped[target].push(m);
           }
-          setMessagesByMode(grouped);
+          setHistoryByMode(grouped);
         } else if (parsed && typeof parsed === "object") {
           const restored = emptyMessages();
           for (const k of Object.keys(restored) as ModeId[]) {
             const arr = (parsed as Record<string, unknown>)[k];
             if (Array.isArray(arr)) restored[k] = arr as ChatMessage[];
           }
-          setMessagesByMode(restored);
+          setHistoryByMode(restored);
         }
       }
     } catch {
@@ -340,18 +398,21 @@ export default function Home() {
   }, []);
   /* eslint-enable react-hooks/set-state-in-effect */
 
-  // 消息变化时保存到localStorage（全局最多保留100条）
+  // 历史归档变化时保存到localStorage（全局最多保留100条）
   useEffect(() => {
     if (!loaded) return;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(messagesByMode));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(historyByMode));
     } catch {
       // 存储满则忽略
     }
-  }, [messagesByMode, loaded]);
+  }, [historyByMode, loaded]);
 
-  // 正在生成的模式（或当前模式）有新内容时，回答框与代码区同步滚动到底部
+  // 正在生成的模式（或当前模式）有新内容时，回答框与代码区同步滚动到底部。
+  // 生成中若用户已主动向上浏览（userScrolledAwayRef），则不再强拉回底部，方便自由浏览；
+  // 非生成场景（模式切换等）始终跟随。
   useEffect(() => {
+    if (userScrolledAwayRef.current && generatingMode) return;
     const target = generatingMode ?? mode;
     const el = scrollRefs.current[target];
     if (!el) return;
@@ -379,6 +440,8 @@ export default function Home() {
     systemPrompt?: string;
   }) {
     if (isThinking) return;
+    // 新一轮对话：重置浏览标记，让回答区跟随到最新内容
+    userScrolledAwayRef.current = false;
 
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
@@ -426,9 +489,9 @@ export default function Home() {
         applyToAssistant("> （模型没有返回内容，请重试）");
       }
     } catch (err) {
-      // 用户主动中断：保留已生成内容，追加停止提示
+      // 用户主动中断：保留已生成内容，追加停止提示（回答区与历史归档同步）
       if (err instanceof DOMException && err.name === "AbortError") {
-        setMessagesByMode((prev) => ({
+        const stopUpd = (prev: Record<ModeId, ChatMessage[]>) => ({
           ...prev,
           [mode]: prev[mode].map((m) => {
             if (m.id !== assistantId) return m;
@@ -440,7 +503,9 @@ export default function Home() {
                 : "_（已停止生成）_",
             };
           }),
-        }));
+        });
+        setMessagesByMode(stopUpd);
+        setHistoryByMode(stopUpd);
       } else {
         applyToAssistant(
           `> ⚠️ 网络错误：${err instanceof Error ? err.message : "未知错误"}`,
@@ -647,9 +712,9 @@ export default function Home() {
     }
   }
 
-  // 跨所有模式查找并删除指定消息
+  // 跨所有模式查找并删除指定消息（回答区与历史归档同步）
   function handleDeleteMessage(id: string) {
-    setMessagesByMode((prev) => {
+    const del = (prev: Record<ModeId, ChatMessage[]>) => {
       const next: Record<ModeId, ChatMessage[]> = { ...prev };
       for (const k of Object.keys(next) as ModeId[]) {
         if (next[k].some((m) => m.id === id)) {
@@ -657,12 +722,14 @@ export default function Home() {
         }
       }
       return next;
-    });
+    };
+    setMessagesByMode(del);
+    setHistoryByMode(del);
   }
 
-  // 跨所有模式查找并编辑指定消息内容
+  // 跨所有模式查找并编辑指定消息内容（回答区与历史归档同步）
   function handleEditMessage(id: string, content: string) {
-    setMessagesByMode((prev) => {
+    const edit = (prev: Record<ModeId, ChatMessage[]>) => {
       const next: Record<ModeId, ChatMessage[]> = { ...prev };
       for (const k of Object.keys(next) as ModeId[]) {
         if (next[k].some((m) => m.id === id)) {
@@ -670,7 +737,9 @@ export default function Home() {
         }
       }
       return next;
-    });
+    };
+    setMessagesByMode(edit);
+    setHistoryByMode(edit);
   }
 
   return (
@@ -867,6 +936,8 @@ export default function Home() {
               onReady={(handle) => {
                 codeEditorRef.current = handle;
                 handle.onDidScrollChange(handleCodeScroll);
+                // 点击代码行 → 回答区跳转到对应行的讲解
+                handle.onDidChangeCursorPosition(scrollAnswerToLine);
               }}
             />
 
@@ -938,9 +1009,11 @@ export default function Home() {
                   </span>
                   <button
                     type="button"
-                    onClick={() =>
-                      setMessagesByMode((prev) => ({ ...prev, [item.id]: [] }))
-                    }
+                    onClick={() => {
+                      // 清空当前模式：回答区与历史归档一起清
+                      setMessagesByMode((prev) => ({ ...prev, [item.id]: [] }));
+                      setHistoryByMode((prev) => ({ ...prev, [item.id]: [] }));
+                    }}
                     disabled={msgs.length === 0}
                     className="text-xs text-zinc-500 transition-colors hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-40"
                   >
