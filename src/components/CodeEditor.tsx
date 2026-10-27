@@ -1,6 +1,6 @@
 "use client";
 
-import Editor, { loader } from "@monaco-editor/react";
+import Editor, { loader, type OnMount } from "@monaco-editor/react";
 
 // 将 Monaco 界面本地化为中文（右键菜单里的复制/剪切/粘贴、命令面板等）。
 // 必须在编辑器加载前设置；@monaco-editor/react 默认从 CDN 加载 monaco。
@@ -30,6 +30,17 @@ interface CodeEditorProps {
   language?: string;
   onSubmit?: () => void;
   placeholder?: string;
+  /** 编辑器就绪后回调，供父组件做左右区域同步滚动 */
+  onReady?: (handle: CodeEditorHandle) => void;
+}
+
+/** 暴露给父组件的编辑器滚动控制接口（用于与 AI 回答区同步滚动） */
+export interface CodeEditorHandle {
+  onDidScrollChange(cb: (e: { scrollTop: number }) => void): void;
+  getScrollTop(): number;
+  setScrollTop(top: number): void;
+  getScrollHeight(): number;
+  getLayoutInfo(): { height: number };
 }
 
 export default function CodeEditor({
@@ -38,15 +49,9 @@ export default function CodeEditor({
   language = "java",
   onSubmit,
   placeholder,
+  onReady,
 }: CodeEditorProps) {
-  function handleMount(editor: {
-    addAction: (action: {
-      id: string;
-      label: string;
-      keybindings: number[];
-      run: () => void;
-    }) => void;
-  }) {
+  const handleMount: OnMount = (editor) => {
     // Ctrl+Enter 发送
     if (onSubmit) {
       editor.addAction({
@@ -56,7 +61,11 @@ export default function CodeEditor({
         run: () => onSubmit(),
       });
     }
-  }
+    // 暴露滚动控制接口，供页面做左右区域滚动同步
+    if (onReady) {
+      onReady(editor as unknown as CodeEditorHandle);
+    }
+  };
 
   return (
     <div className="relative flex min-h-[200px] flex-1 flex-col overflow-hidden rounded-lg border border-zinc-800 focus-within:border-indigo-500/60 focus-within:ring-2 focus-within:ring-indigo-500/20">
@@ -93,7 +102,8 @@ export default function CodeEditor({
           suggestOnTriggerCharacters: false,
           parameterHints: { enabled: false },
           scrollbar: {
-            vertical: "auto",
+            // 竖向滑动条常显，方便用户随时单独滚动代码区
+            vertical: "visible",
             horizontal: "auto",
           },
         }}

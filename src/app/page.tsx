@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import MarkdownMessage from "@/components/MarkdownMessage";
-import CodeEditor from "@/components/CodeEditor";
+import CodeEditor, { type CodeEditorHandle } from "@/components/CodeEditor";
 import HistoryPanel from "@/components/HistoryPanel";
 import ErrorHandbook from "@/components/ErrorHandbook";
 import ModelSettings from "@/components/ModelSettings";
@@ -197,16 +197,24 @@ export default function Home() {
   const [keyConfigured, setKeyConfigured] = useState<boolean | null>(null);
   // 服务端实际生效的默认模型名（可能被 LLM_MODEL 覆盖），用于顶部显示，避免写死
   const [effectiveModel, setEffectiveModel] = useState("");
-  // 薄弱点分析结果：以弹窗形式独立展示，不进入任一模式的对话流
+  // 薄弱点分析结果：以弹窗形式独立展示，不进入任一模式的对话流。
+  // error 用于生成失败/停止时的提示，生成期间保留旧 content，新结果完成才替代
   const [weakness, setWeakness] = useState<{
     id: string;
     content: string;
     isLoading: boolean;
+    error?: string;
   } | null>(null);
+  // 弹窗打开状态与内容分离：关闭后保留上一次分析，再次打开仍可看到旧结果
+  const [weaknessOpen, setWeaknessOpen] = useState(false);
 
   const scrollRefs = useRef<Partial<Record<ModeId, HTMLDivElement | null>>>({});
   const abortRef = useRef<AbortController | null>(null);
   const weaknessAbortRef = useRef<AbortController | null>(null);
+  // 代码区（Monaco）滚动控制句柄，用于与 AI 回答区同步滚动
+  const codeEditorRef = useRef<CodeEditorHandle | null>(null);
+  // 同步滚动时的防抖锁：程序性滚动触发的事件跳过，避免互相回写造成抖动
+  const syncingRef = useRef(false);
 
   // 有任一模式正在生成即视为 isThinking（沿用历史逻辑）
   const isThinking = generatingMode !== null;
@@ -247,6 +255,51 @@ export default function Home() {
       ...prev,
       [modeId]: prev[modeId].map((m) => (m.id === id ? { ...m, content } : m)),
     }));
+  }
+
+  // ---------- 代码区与 AI 回答区同步滚动 ----------
+
+  /** 当前模式 AI 回答框的滚动容器 */
+  function activeAnswerEl(): HTMLDivElement | null {
+    return scrollRefs.current[mode] ?? null;
+  }
+
+  /** 代码区可滚动高度（0 表示内容不满一屏，无需滚动） */
+  function codeMaxScroll(): number {
+    const ed = codeEditorRef.current;
+    if (!ed) return 0;
+    return Math.max(ed.getScrollHeight() - ed.getLayoutInfo().height, 0);
+  }
+
+  /** 按滚动比例同步：代码区 → AI 回答区 */
+  function handleCodeScroll(e: { scrollTop: number }) {
+    if (syncingRef.current) return;
+    const target = activeAnswerEl();
+    if (!target) return;
+    const cMax = codeMaxScroll();
+    if (cMax <= 0) return;
+    const aMax = Math.max(target.scrollHeight - target.clientHeight, 0);
+    if (aMax <= 0) return;
+    const ratio = Math.min(Math.max(e.scrollTop / cMax, 0), 1);
+    syncingRef.current = true;
+    target.scrollTop = ratio * aMax;
+    syncingRef.current = false;
+  }
+
+  /** 按滚动比例同步：AI 回答区 → 代码区 */
+  function handleAnswerScroll() {
+    if (syncingRef.current) return;
+    const source = activeAnswerEl();
+    const ed = codeEditorRef.current;
+    if (!source || !ed) return;
+    const aMax = Math.max(source.scrollHeight - source.clientHeight, 0);
+    if (aMax <= 0) return;
+    const ratio = Math.min(Math.max(source.scrollTop / aMax, 0), 1);
+    const cMax = codeMaxScroll();
+    if (cMax <= 0) return;
+    syncingRef.current = true;
+    ed.setScrollTop(ratio * cMax);
+    syncingRef.current = false;
   }
 
   const activeMode = MODES.find((item) => item.id === mode) ?? MODES[0];
@@ -297,11 +350,18 @@ export default function Home() {
     }
   }, [messagesByMode, loaded]);
 
-  // 正在生成的模式（或当前模式）有新内容时滚动到底部
+  // 正在生成的模式（或当前模式）有新内容时，回答框与代码区同步滚动到底部
   useEffect(() => {
     const target = generatingMode ?? mode;
     const el = scrollRefs.current[target];
-    el?.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+    const ed = codeEditorRef.current;
+    if (ed) {
+      syncingRef.current = true;
+      ed.setScrollTop(ed.getScrollHeight());
+      syncingRef.current = false;
+    }
   }, [messagesByMode, mode, generatingMode]);
 
   // 提示自动消失
@@ -422,7 +482,7 @@ export default function Home() {
     if (mode === "debug") {
       const off = classifyError(content);
       if (off) {
-        setInput("");
+        // 代码保留在左侧编辑框，不重复出现在右侧回答区
         appendOfflineReply(content, off);
         return;
       }
@@ -447,7 +507,7 @@ export default function Home() {
       )
       .map((m) => ({ role: m.role, content: m.content }));
 
-    setInput("");
+    // 代码保留在左侧编辑框：右侧回答区只显示 AI 的分析，不再重复展示用户代码
     await runTurn({
       userBubbleContent: content,
       payloadContent: finalContent,
@@ -456,11 +516,8 @@ export default function Home() {
   }
 
   // 「分析薄弱点」：基于历史记录做个性化分析。
-  // 结果写入独立的 weakness 面板，不再追加到 AI 回答区的对话流。
-  async function handleAnalyzeWeakness() {
-    if (isThinking || weakness?.isLoading) return;
-
-    // 基于所有模式的对话记录做分析，跨模式发现薄弱环节
+  /** 收集用于薄弱点分析的历史对话（最近 10 条有意义的消息），无历史时返回 null */
+  function weaknessHistory(): string | null {
     const meaningful = allMessages
       .filter(
         (m) =>
@@ -468,30 +525,64 @@ export default function Home() {
           !m.content.startsWith("> ⚠️") &&
           !m.content.startsWith("> （"),
       )
-      .slice(-20);
-
-    if (meaningful.length === 0) {
-      setNotice("还没有足够的历史对话，先发几条消息再来分析吧");
-      return;
-    }
-
+      .slice(-10);
+    if (meaningful.length === 0) return null;
     const historyText = meaningful
       .map(
         (m) =>
           `【${m.role === "user" ? "学生" : "AI 助手"} · ${MODE_LABEL[m.mode]}】\n${m.content}`,
       )
       .join("\n\n---\n\n");
+    return `【分析请求】\n📊 请根据我们的历史对话，分析我的薄弱环节并给出改进建议\n\n【我的历史对话记录】\n${historyText}\n\n请基于以上记录做个性化薄弱点分析。`;
+  }
 
-    const payloadContent = `【分析请求】\n📊 请根据我们的历史对话，分析我的薄弱环节并给出改进建议\n\n【我的历史对话记录】\n${historyText}\n\n请基于以上记录做个性化薄弱点分析。`;
+  /** 打开薄弱点弹窗：保留上一次的分析结果，不自动重新生成 */
+  function handleAnalyzeWeakness() {
+    if (isThinking || weakness?.isLoading) return;
+    if (weaknessHistory() === null) {
+      setNotice("还没有足够的历史对话，先发几条消息再来分析吧");
+      return;
+    }
+    // 首次打开时初始化空的分析记录（显示空态，提示点击「生成」）
+    if (!weakness) {
+      setWeakness({ id: crypto.randomUUID(), content: "", isLoading: false });
+    }
+    setWeaknessOpen(true);
+  }
+
+  /** 生成新的薄弱点分析：后台完整生成。生成期间保留旧分析可见，新结果完成才替代 */
+  async function handleGenerateWeakness() {
+    if (weakness?.isLoading) return;
+    const payloadContent = weaknessHistory();
+    if (payloadContent === null) {
+      setNotice("还没有足够的历史对话，先发几条消息再来分析吧");
+      return;
+    }
 
     const id = crypto.randomUUID();
-    setWeakness({ id, content: "", isLoading: true });
+    // 生成前是否已有旧分析：用于停止时决定提示文案（保留旧分析 or 无内容）
+    const hadContent = Boolean(weakness?.content?.trim());
+    // 只标记「生成中」，不清空旧 content：新分析完成后才替代旧的分析
+    setWeakness((cur) => ({
+      id,
+      content: cur?.content ?? "",
+      isLoading: true,
+      error: undefined,
+    }));
+    setWeaknessOpen(true);
 
     const controller = new AbortController();
     weaknessAbortRef.current = controller;
 
+    // 成功结果：一次性写入 content，替代旧分析并清空错误提示
     const apply = (content: string) => {
-      setWeakness((cur) => (cur ? { ...cur, content } : cur));
+      setWeakness((cur) =>
+        cur ? { ...cur, content, error: undefined } : cur,
+      );
+    };
+    // 失败/停止：保留旧 content，把提示放到 error 字段
+    const fail = (error: string) => {
+      setWeakness((cur) => (cur ? { ...cur, error } : cur));
     };
 
     try {
@@ -500,31 +591,25 @@ export default function Home() {
         payloadContent,
         [],
         controller.signal,
-        apply,
+        // 后台完整生成：流式增量只累积、不逐字渲染到前端，完成后一次性显示
+        () => {},
         modelConfig,
         WEAKNESS_ANALYSIS_PROMPT,
       );
 
       if (!result.ok) {
-        apply(`> ⚠️ 请求失败：${result.error}`);
+        fail(`⚠️ 请求失败：${result.error}`);
       } else if (!result.content) {
-        apply("> （模型没有返回内容，请重试）");
+        fail("⚠️ 模型没有返回内容，请重试");
+      } else {
+        apply(result.content);
       }
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
-        setWeakness((cur) =>
-          cur
-            ? {
-                ...cur,
-                content: cur.content.trim()
-                  ? `${cur.content}\n\n_（已停止分析）_`
-                  : "_（已停止分析）_",
-              }
-            : cur,
-        );
+        fail(hadContent ? "已停止生成，保留原有分析" : "已停止分析");
       } else {
-        apply(
-          `> ⚠️ 网络错误：${err instanceof Error ? err.message : "未知错误"}`,
+        fail(
+          `⚠️ 网络错误：${err instanceof Error ? err.message : "未知错误"}`,
         );
       }
     } finally {
@@ -779,6 +864,10 @@ export default function Home() {
               language={language}
               onSubmit={handleSubmit}
               placeholder={activeMode.placeholder}
+              onReady={(handle) => {
+                codeEditorRef.current = handle;
+                handle.onDidScrollChange(handleCodeScroll);
+              }}
             />
 
             <div className="flex items-center justify-between gap-3">
@@ -829,6 +918,8 @@ export default function Home() {
         {MODES.map((item) => {
           const active = item.id === mode;
           const msgs = messagesByMode[item.id] ?? [];
+          // 回答框只展示 AI 回答，用户代码只保留在左侧编辑框
+          const visible = msgs.filter((m) => m.role === "assistant");
           const thinking = generatingMode === item.id;
           return (
             <section
@@ -843,7 +934,7 @@ export default function Home() {
                 </h2>
                 <div className="flex items-center gap-3">
                   <span className="text-xs text-zinc-500">
-                    {msgs.length} 条对话
+                    {visible.length} 条回答
                   </span>
                   <button
                     type="button"
@@ -862,9 +953,10 @@ export default function Home() {
                 ref={(el) => {
                   scrollRefs.current[item.id] = el;
                 }}
+                onScroll={handleAnswerScroll}
                 className="scroll-area flex-1 space-y-4 overflow-y-auto px-4 py-4"
               >
-                {msgs.length === 0 && !thinking ? (
+                {visible.length === 0 && !thinking ? (
                   <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
                     <div className="grid h-12 w-12 place-items-center rounded-xl bg-zinc-800/60 text-zinc-500">
                       <CodeIcon className="h-6 w-6" />
@@ -880,51 +972,28 @@ export default function Home() {
                   </div>
                 ) : null}
 
-                {msgs.map((message) =>
-                  message.role === "user" ? (
-                    <div key={message.id} className="flex justify-end">
-                      <div className="max-w-[85%] rounded-xl rounded-br-sm border border-indigo-500/25 bg-indigo-500/10 px-3.5 py-2.5">
-                        <div className="mb-1 flex items-center justify-between gap-3">
-                          <p className="text-[11px] text-indigo-300/80">
-                            {MODE_LABEL[message.mode]} · 你的输入
-                          </p>
-                          <button
-                            type="button"
-                            onClick={() => handleCopy(message.content, message.id)}
-                            disabled={!message.content.trim()}
-                            className="text-[11px] text-indigo-300/70 transition-colors hover:text-indigo-200 disabled:cursor-not-allowed disabled:opacity-40"
-                          >
-                            {copiedId === message.id ? "已复制 ✓" : "复制"}
-                          </button>
-                        </div>
-                        <pre className="font-mono text-[13px] leading-relaxed break-words whitespace-pre-wrap text-zinc-100">
-                          {message.content}
-                        </pre>
-                      </div>
+                {visible.map((message) => (
+                  <div
+                    key={message.id}
+                    className="rounded-xl border border-zinc-800 bg-zinc-950/50 px-4 py-3.5"
+                  >
+                    <div className="mb-2 flex items-center justify-between">
+                      <p className="flex items-center gap-2 text-[11px] text-zinc-500">
+                        <span className="h-1.5 w-1.5 rounded-full bg-indigo-400" />
+                        AI 助手 · {MODE_LABEL[message.mode]}
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => handleCopy(message.content, message.id)}
+                        disabled={!message.content.trim()}
+                        className="text-[11px] text-zinc-500 transition-colors hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        {copiedId === message.id ? "已复制 ✓" : "复制"}
+                      </button>
                     </div>
-                  ) : (
-                    <div
-                      key={message.id}
-                      className="rounded-xl border border-zinc-800 bg-zinc-950/50 px-4 py-3.5"
-                    >
-                      <div className="mb-2 flex items-center justify-between">
-                        <p className="flex items-center gap-2 text-[11px] text-zinc-500">
-                          <span className="h-1.5 w-1.5 rounded-full bg-indigo-400" />
-                          AI 助手 · {MODE_LABEL[message.mode]}
-                        </p>
-                        <button
-                          type="button"
-                          onClick={() => handleCopy(message.content, message.id)}
-                          disabled={!message.content.trim()}
-                          className="text-[11px] text-zinc-500 transition-colors hover:text-zinc-300 disabled:cursor-not-allowed disabled:opacity-40"
-                        >
-                          {copiedId === message.id ? "已复制 ✓" : "复制"}
-                        </button>
-                      </div>
-                      <MarkdownMessage content={message.content} />
-                    </div>
-                  ),
-                )}
+                    <MarkdownMessage content={message.content} />
+                  </div>
+                ))}
 
                 {thinking ? (
                   <div className="flex items-center gap-2 rounded-xl border border-zinc-800 bg-zinc-950/50 px-4 py-3.5 text-sm text-zinc-400">
@@ -944,14 +1013,16 @@ export default function Home() {
         </div>
       ) : null}
 
-      {weakness ? (
+      {weaknessOpen && weakness ? (
         <WeaknessAnalysis
           id={weakness.id}
           content={weakness.content}
           isLoading={weakness.isLoading}
+          onGenerate={handleGenerateWeakness}
           onClose={() => {
+            // 只关闭弹窗，保留上一次分析内容，下次打开仍可见
             weaknessAbortRef.current?.abort();
-            setWeakness(null);
+            setWeaknessOpen(false);
           }}
           onStop={handleStopWeakness}
         />
