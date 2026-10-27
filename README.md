@@ -49,6 +49,11 @@ npm install
 
 > 仓库内已包含 `.npmrc`，默认走国内镜像源（npmmirror），国内安装速度显著快于官方源。
 > 若你在海外，删除 `.npmrc` 即可切回官方源；依赖版本由 `package-lock.json` 锁定，与源无关。
+> 
+> 注意：镜像源不实现 npm 的安全审计接口，直接执行 
+pm audit 会报 NOT_IMPLEMENTED。
+> 需要审计时临时指定官方源：
+pm audit --registry=https://registry.npmjs.org（实测结果：0 vulnerabilities）。
 
 ### 3. 配置 API Key（二选一）
 
